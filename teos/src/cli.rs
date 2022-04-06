@@ -57,7 +57,7 @@ async fn main() {
                 Ok(user_id) => {
                     match client
                         .get_user(Request::new(msgs::GetUserRequest {
-                            user_id: user_id.serialize(),
+                            user_id: user_id.to_vec(),
                         }))
                         .await
                     {

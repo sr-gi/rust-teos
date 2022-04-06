@@ -325,7 +325,7 @@ impl Watcher {
     ) -> Result<(AppointmentReceipt, u32, u32), AddAppointmentFailure> {
         let user_id = self
             .gatekeeper
-            .authenticate_user(&appointment.serialize(), &user_signature)
+            .authenticate_user(&appointment.to_vec(), &user_signature)
             .map_err(|_| AddAppointmentFailure::AuthenticationFailure)?;
 
         let (has_subscription_expired, expiry) =
@@ -942,7 +942,7 @@ mod tests {
         assert_eq!(receipt.start_block(), START_HEIGHT as u32);
         assert_eq!(receipt.user_signature(), expected_user_signature);
         let recovered_pk =
-            cryptography::recover_pk(&receipt.serialize(), &receipt.signature().unwrap()).unwrap();
+            cryptography::recover_pk(&receipt.to_vec(), &receipt.signature().unwrap()).unwrap();
         assert_eq!(UserId(recovered_pk), tower_id);
     }
 
@@ -1078,7 +1078,7 @@ mod tests {
         // If we add some trackers to the system and create a new Responder reusing the same db
         // (as if simulating a bootstrap from existing data), the data should be properly loaded.
         for _ in 0..10 {
-            let user_sig = cryptography::sign(&appointment.serialize(), &user_sk).unwrap();
+            let user_sig = cryptography::sign(&appointment.to_vec(), &user_sk).unwrap();
             watcher
                 .add_appointment(appointment.clone(), user_sig.clone())
                 .unwrap();
@@ -1111,7 +1111,7 @@ mod tests {
         );
 
         assert!(cryptography::verify(
-            &receipt.serialize(),
+            &receipt.to_vec(),
             &receipt.signature().unwrap(),
             &tower_pk
         ));
@@ -1144,7 +1144,7 @@ mod tests {
 
         // Add the appointment for a new user (twice so we can check that updates work)
         for _ in 0..2 {
-            let user_sig = cryptography::sign(&appointment.serialize(), &user_sk).unwrap();
+            let user_sig = cryptography::sign(&appointment.to_vec(), &user_sk).unwrap();
             let (receipt, slots, expiry) = watcher
                 .add_appointment(appointment.clone(), user_sig.clone())
                 .unwrap();
@@ -1157,7 +1157,7 @@ mod tests {
         let user2_id = UserId(user2_pk);
         watcher.register(user2_id).unwrap();
 
-        let user2_sig = cryptography::sign(&appointment.serialize(), &user2_sk).unwrap();
+        let user2_sig = cryptography::sign(&appointment.to_vec(), &user2_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(appointment.clone(), user2_sig.clone())
             .unwrap();
@@ -1182,7 +1182,7 @@ mod tests {
         // If an appointment is already in the Responder, it should bounce
         let (uuid, triggered_appointment) = generate_dummy_appointment_with_user(user_id, None);
         let signature =
-            cryptography::sign(&triggered_appointment.inner.serialize(), &user_sk).unwrap();
+            cryptography::sign(&triggered_appointment.inner.to_vec(), &user_sk).unwrap();
         watcher
             .add_appointment(triggered_appointment.inner.clone(), signature.clone())
             .unwrap();
@@ -1205,8 +1205,7 @@ mod tests {
         let dispute_tx = tip_txs.last().unwrap();
         let (uuid, appointment_in_cache) =
             generate_dummy_appointment_with_user(user_id, Some(&dispute_tx.txid()));
-        let user_sig =
-            cryptography::sign(&appointment_in_cache.inner.serialize(), &user_sk).unwrap();
+        let user_sig = cryptography::sign(&appointment_in_cache.inner.to_vec(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(appointment_in_cache.inner.clone(), user_sig.clone())
             .unwrap();
@@ -1238,8 +1237,7 @@ mod tests {
         let (uuid, mut invalid_appointment) =
             generate_dummy_appointment_with_user(user_id, Some(&dispute_tx.txid()));
         invalid_appointment.inner.encrypted_blob.reverse();
-        let user_sig =
-            cryptography::sign(&invalid_appointment.inner.serialize(), &user_sk).unwrap();
+        let user_sig = cryptography::sign(&invalid_appointment.inner.to_vec(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(invalid_appointment.inner.clone(), user_sig.clone())
             .unwrap();
@@ -1266,7 +1264,7 @@ mod tests {
 
         let dispute_tx = &tip_txs[tip_txs.len() - 2];
         let invalid_appointment = generate_dummy_appointment(Some(&dispute_tx.txid())).inner;
-        let user_sig = cryptography::sign(&invalid_appointment.serialize(), &user_sk).unwrap();
+        let user_sig = cryptography::sign(&invalid_appointment.to_vec(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(invalid_appointment, user_sig.clone())
             .unwrap();
@@ -1309,7 +1307,7 @@ mod tests {
 
         let dispute_txid = Txid::from_slice(&get_random_bytes(32)).unwrap();
         let new_appointment = generate_dummy_appointment(Some(&dispute_txid)).inner;
-        let new_app_sig = cryptography::sign(&new_appointment.serialize(), &user_sk).unwrap();
+        let new_app_sig = cryptography::sign(&new_appointment.to_vec(), &user_sk).unwrap();
 
         assert!(matches!(
             watcher.add_appointment(new_appointment, new_app_sig),
@@ -1486,7 +1484,7 @@ mod tests {
         watcher
             .add_appointment(
                 appointment.clone(),
-                cryptography::sign(&appointment.serialize(), &user_sk).unwrap(),
+                cryptography::sign(&appointment.to_vec(), &user_sk).unwrap(),
             )
             .unwrap();
 
@@ -1886,11 +1884,11 @@ mod tests {
         let uuid1 = UUID::new(appointment.locator(), user_id);
         let uuid2 = UUID::new(appointment.locator(), user2_id);
 
-        let user_sig = cryptography::sign(&appointment.inner.serialize(), &user_sk).unwrap();
+        let user_sig = cryptography::sign(&appointment.inner.to_vec(), &user_sk).unwrap();
         watcher
             .add_appointment(appointment.inner.clone(), user_sig)
             .unwrap();
-        let user2_sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
+        let user2_sig = cryptography::sign(&appointment.inner.to_vec(), &user2_sk).unwrap();
         watcher
             .add_appointment(appointment.inner.clone(), user2_sig)
             .unwrap();
@@ -1953,7 +1951,7 @@ mod tests {
         // Check triggers. Add a new appointment and trigger it with valid data.
         let dispute_tx = get_random_tx();
         let appointment = generate_dummy_appointment(Some(&dispute_tx.txid()));
-        let sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
+        let sig = cryptography::sign(&appointment.inner.to_vec(), &user2_sk).unwrap();
         let uuid = UUID::new(appointment.locator(), user2_id);
         watcher.add_appointment(appointment.inner, sig).unwrap();
 
@@ -1991,7 +1989,7 @@ mod tests {
         // Check triggering with a valid formatted transaction but that is rejected by the Responder.
         let dispute_tx = get_random_tx();
         let appointment = generate_dummy_appointment(Some(&dispute_tx.txid()));
-        let sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
+        let sig = cryptography::sign(&appointment.inner.to_vec(), &user2_sk).unwrap();
         let uuid = UUID::new(appointment.locator(), user2_id);
         watcher.add_appointment(appointment.inner, sig).unwrap();
 
@@ -2035,7 +2033,7 @@ mod tests {
         // Modify the encrypted blob so the data is invalid.
         //Both non-decryptable blobs and blobs with invalid transactions will yield an invalid trigger
         appointment.inner.encrypted_blob.reverse();
-        let sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
+        let sig = cryptography::sign(&appointment.inner.to_vec(), &user2_sk).unwrap();
         let uuid = UUID::new(appointment.locator(), user2_id);
         watcher
             .add_appointment(appointment.inner.clone(), sig)
