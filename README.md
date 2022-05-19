@@ -107,9 +107,11 @@ For help on the available arguments and commands, you can run:
 teos-cli -h
 ```
 
-## Interacting with TEOS as a client
+## TEOS clients
 
-FIXME: Add client and docs
+Here is a list of the available clients for `teos`:
+
+- [watchtower-plugin for CLN](watchtower-plugin/)
 
 ## Contributing 
 Refer to [CONTRIBUTING.md](CONTRIBUTING.md)
