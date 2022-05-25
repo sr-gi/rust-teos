@@ -1,7 +1,9 @@
 //! Logic related to the Carrier, the component in charge or sending/requesting transaction data from/to `bitcoind`.
 
+use async_recursion::async_recursion;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 use crate::responder::ConfirmationStatus;
 use crate::{errors, rpc_errors};
@@ -18,7 +20,7 @@ pub struct Carrier {
     /// The underlying bitcoin client used by the [Carrier].
     bitcoin_cli: Arc<BitcoindClient>,
     /// A flag that indicates wether bitcoind is reachable or not.
-    bitcoind_reachable: Arc<(Mutex<bool>, Condvar)>,
+    bitcoind_reachable: Arc<(Mutex<bool>, Notify)>,
     /// A map of receipts already issued by the [Carrier].
     /// Used to prevent potentially re-sending the same transaction over and over.
     issued_receipts: HashMap<Txid, ConfirmationStatus>,
@@ -30,7 +32,7 @@ impl Carrier {
     /// Creates a new [Carrier] instance.
     pub fn new(
         bitcoin_cli: Arc<BitcoindClient>,
-        bitcoind_reachable: Arc<(Mutex<bool>, Condvar)>,
+        bitcoind_reachable: Arc<(Mutex<bool>, Notify)>,
         last_known_block_height: u32,
     ) -> Self {
         Carrier {
@@ -55,11 +57,10 @@ impl Carrier {
     }
 
     /// Hangs the process until bitcoind is reachable. If bitcoind is already reachable it just passes trough.
-    fn hang_until_bitcoind_reachable(&self) {
-        let (lock, notifier) = &*self.bitcoind_reachable;
-        let mut reachable = lock.lock().unwrap();
-        while !*reachable {
-            reachable = notifier.wait(reachable).unwrap();
+    async fn hang_until_bitcoind_reachable(&self) {
+        let (reachable, notifier) = &*self.bitcoind_reachable;
+        if !*reachable.lock().unwrap() {
+            notifier.notified().await;
         }
     }
 
@@ -72,8 +73,9 @@ impl Carrier {
     /// Sends a [Transaction] to the Bitcoin network.
     ///
     /// Returns a [ConfirmationStatus] indicating whether the transaction was accepted by the node or not.
-    pub(crate) fn send_transaction(&mut self, tx: &Transaction) -> ConfirmationStatus {
-        self.hang_until_bitcoind_reachable();
+    #[async_recursion]
+    pub(crate) async fn send_transaction(&mut self, tx: &Transaction) -> ConfirmationStatus {
+        self.hang_until_bitcoind_reachable().await;
 
         if let Some(receipt) = self.issued_receipts.get(&tx.txid()) {
             log::info!("Transaction already sent: {}", tx.txid());
@@ -104,7 +106,7 @@ impl Carrier {
                         tx.txid()
                     );
 
-                    ConfirmationStatus::ConfirmedIn(self.get_tx_height(&tx.txid()).unwrap())
+                    ConfirmationStatus::ConfirmedIn(self.get_tx_height(&tx.txid()).await.unwrap())
                 }
                 rpc_errors::RPC_DESERIALIZATION_ERROR => {
                     // Adding this here just for completeness. We should never end up here. The Carrier only sends txs handed by the Responder,
@@ -125,7 +127,7 @@ impl Carrier {
                 // Connection refused, bitcoind is down.
                 log::error!("Connection lost with bitcoind, retrying request when possible");
                 self.flag_bitcoind_unreachable();
-                self.send_transaction(tx)
+                self.send_transaction(tx).await
             }
             Err(e) => {
                 // TODO: This may need finer catching.
@@ -140,17 +142,18 @@ impl Carrier {
     }
 
     /// Gets the block height at where a given [Transaction] was confirmed at (if any).
-    fn get_tx_height(&self, txid: &Txid) -> Option<u32> {
-        if let Some(block_hash) = self.get_block_hash_for_tx(txid) {
-            self.get_block_height(&block_hash)
+    async fn get_tx_height(&self, txid: &Txid) -> Option<u32> {
+        if let Some(block_hash) = self.get_block_hash_for_tx(txid).await {
+            self.get_block_height(&block_hash).await
         } else {
             None
         }
     }
 
     /// Queries the height of a given [Block](bitcoin::Block). Returns it if the block can be found. Returns [None] otherwise.
-    fn get_block_height(&self, block_hash: &BlockHash) -> Option<u32> {
-        self.hang_until_bitcoind_reachable();
+    #[async_recursion]
+    async fn get_block_height(&self, block_hash: &BlockHash) -> Option<u32> {
+        self.hang_until_bitcoind_reachable().await;
 
         match self.bitcoin_cli.get_block_header_info(block_hash) {
             Ok(header_data) => Some(header_data.height as u32),
@@ -168,7 +171,7 @@ impl Carrier {
                 // Connection refused, bitcoind is down.
                 log::error!("Connection lost with bitcoind, retrying request when possible");
                 self.flag_bitcoind_unreachable();
-                self.get_block_height(block_hash)
+                self.get_block_height(block_hash).await
             }
             // TODO: This may need finer catching.
             Err(e) => {
@@ -179,8 +182,9 @@ impl Carrier {
     }
 
     /// Gets the block hash where a given [Transaction] was confirmed at (if any).
-    pub(crate) fn get_block_hash_for_tx(&self, txid: &Txid) -> Option<BlockHash> {
-        self.hang_until_bitcoind_reachable();
+    #[async_recursion]
+    pub(crate) async fn get_block_hash_for_tx(&self, txid: &Txid) -> Option<BlockHash> {
+        self.hang_until_bitcoind_reachable().await;
 
         match self.bitcoin_cli.get_raw_transaction_info(txid, None) {
             Ok(tx_data) => tx_data.blockhash,
@@ -201,7 +205,7 @@ impl Carrier {
                 // Connection refused, bitcoind is down.
                 log::error!("Connection lost with bitcoind, retrying request when possible");
                 self.flag_bitcoind_unreachable();
-                self.get_block_hash_for_tx(txid)
+                self.get_block_hash_for_tx(txid).await
             }
             // TODO: This may need finer catching.
             Err(e) => {
@@ -240,10 +244,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_clear_receipts() {
+    #[tokio::test]
+    async fn test_clear_receipts() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
@@ -264,17 +268,17 @@ mod tests {
         assert!(carrier.issued_receipts.is_empty());
     }
 
-    #[test]
-    fn test_send_transaction_ok() {
+    #[tokio::test]
+    async fn test_send_transaction_ok() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        let r = carrier.send_transaction(&tx);
+        let r = carrier.send_transaction(&tx).await;
 
         assert_eq!(r, ConfirmationStatus::InMempoolSince(start_height));
 
@@ -282,19 +286,19 @@ mod tests {
         assert_eq!(carrier.issued_receipts.get(&tx.txid()).unwrap(), &r);
     }
 
-    #[test]
-    fn test_send_transaction_verify_rejected() {
+    #[tokio::test]
+    async fn test_send_transaction_verify_rejected() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::with_error(
             rpc_errors::RPC_VERIFY_REJECTED as i64,
         ));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        let r = carrier.send_transaction(&tx);
+        let r = carrier.send_transaction(&tx).await;
 
         assert_eq!(
             r,
@@ -305,18 +309,18 @@ mod tests {
         assert_eq!(carrier.issued_receipts.get(&tx.txid()).unwrap(), &r);
     }
 
-    #[test]
-    fn test_send_transaction_verify_error() {
+    #[tokio::test]
+    async fn test_send_transaction_verify_error() {
         let bitcoind_mock =
             BitcoindMock::new(MockOptions::with_error(rpc_errors::RPC_VERIFY_ERROR as i64));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        let r = carrier.send_transaction(&tx);
+        let r = carrier.send_transaction(&tx).await;
 
         assert_eq!(
             r,
@@ -327,21 +331,21 @@ mod tests {
         assert_eq!(carrier.issued_receipts.get(&tx.txid()).unwrap(), &r);
     }
 
-    #[test]
-    fn test_send_transaction_verify_already_in_chain() {
+    #[tokio::test]
+    async fn test_send_transaction_verify_already_in_chain() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::new(
             rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64,
             BlockHash::default(),
             START_HEIGHT,
         ));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        let r = carrier.send_transaction(&tx);
+        let r = carrier.send_transaction(&tx).await;
 
         assert_eq!(r, ConfirmationStatus::ConfirmedIn(start_height));
 
@@ -349,18 +353,18 @@ mod tests {
         assert_eq!(carrier.issued_receipts.get(&tx.txid()).unwrap(), &r);
     }
 
-    #[test]
-    fn test_send_transaction_unexpected_error() {
+    #[tokio::test]
+    async fn test_send_transaction_unexpected_error() {
         let bitcoind_mock =
             BitcoindMock::new(MockOptions::with_error(rpc_errors::RPC_MISC_ERROR as i64));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        let r = carrier.send_transaction(&tx);
+        let r = carrier.send_transaction(&tx).await;
 
         assert_eq!(
             r,
@@ -371,11 +375,11 @@ mod tests {
         assert_eq!(carrier.issued_receipts.get(&tx.txid()).unwrap(), &r);
     }
 
-    #[test]
-    fn test_send_transaction_connection_error() {
+    #[tokio::test]
+    async fn test_send_transaction_connection_error() {
         // Try to connect to an offline bitcoind.
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(false), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(false), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         let mut carrier = Carrier::new(bitcoin_cli, bitcoind_reachable.clone(), start_height);
@@ -387,11 +391,11 @@ mod tests {
             thread::sleep(delay);
             let (reachable, notifier) = &*bitcoind_reachable;
             *reachable.lock().unwrap() = true;
-            notifier.notify_all();
+            notifier.notify_waiters();
         });
 
         let before = std::time::Instant::now();
-        carrier.send_transaction(&tx);
+        carrier.send_transaction(&tx).await;
 
         // Check the request has hanged for ~delay
         assert_eq!(
@@ -400,12 +404,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_get_tx_height_ok() {
+    #[tokio::test]
+    async fn test_get_tx_height_ok() {
         let target_height = 21;
         let bitcoind_mock =
             BitcoindMock::new(MockOptions::with_block(BlockHash::default(), target_height));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
@@ -413,79 +417,82 @@ mod tests {
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize::<Transaction>(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
         assert_eq!(
-            carrier.get_tx_height(&tx.txid()),
+            carrier.get_tx_height(&tx.txid()).await,
             Some(target_height as u32)
         );
     }
 
-    #[test]
-    fn test_get_tx_height_not_found() {
+    #[tokio::test]
+    async fn test_get_tx_height_not_found() {
         // Hee we are not testing the case where the block hash is unknown (which will also return None). This is because we only
         // learn block hashes from bitcoind, and once a block is known, it cannot disappear (ir can be disconnected, but not banish).
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         let tx = consensus::deserialize::<Transaction>(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
-        assert_eq!(carrier.get_tx_height(&tx.txid()), None);
+        assert_eq!(carrier.get_tx_height(&tx.txid()).await, None);
     }
 
-    #[test]
-    fn test_get_block_height_ok() {
+    #[tokio::test]
+    async fn test_get_block_height_ok() {
         let target_height = 21;
         let block_hash = BlockHash::default();
         let bitcoind_mock = BitcoindMock::new(MockOptions::with_block(block_hash, target_height));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
         assert_eq!(
-            carrier.get_block_height(&block_hash),
+            carrier.get_block_height(&block_hash).await,
             Some(target_height as u32)
         );
     }
 
-    #[test]
-    fn test_get_block_height_not_found() {
+    #[tokio::test]
+    async fn test_get_block_height_not_found() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
-        assert_eq!(carrier.get_block_height(&BlockHash::default()), None);
+        assert_eq!(carrier.get_block_height(&BlockHash::default()).await, None);
     }
 
-    #[test]
-    fn test_get_block_hash_for_tx_ok() {
+    #[tokio::test]
+    async fn test_get_block_hash_for_tx_ok() {
         let block_hash = BlockHash::default();
         let bitcoind_mock = BitcoindMock::new(MockOptions::with_block(block_hash, 21));
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let tx = consensus::deserialize::<Transaction>(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
-        assert_eq!(carrier.get_block_hash_for_tx(&tx.txid()), Some(block_hash));
+        assert_eq!(
+            carrier.get_block_hash_for_tx(&tx.txid()).await,
+            Some(block_hash)
+        );
     }
 
-    #[test]
-    fn test_get_block_hash_for_tx_not_found() {
+    #[tokio::test]
+    async fn test_get_block_hash_for_tx_not_found() {
         let bitcoind_mock = BitcoindMock::new(MockOptions::empty());
-        let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+        let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
         let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
         let start_height = START_HEIGHT as u32;
         start_server(bitcoind_mock);
 
         let tx = consensus::deserialize::<Transaction>(&Vec::from_hex(TX_HEX).unwrap()).unwrap();
         let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, start_height);
-        assert_eq!(carrier.get_block_hash_for_tx(&tx.txid()), None);
+        assert_eq!(carrier.get_block_hash_for_tx(&tx.txid()).await, None);
     }
 }

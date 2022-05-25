@@ -2,6 +2,7 @@
 
 use log;
 
+use futures::executor::block_on;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -318,7 +319,7 @@ impl Watcher {
     /// monitored by the [Watcher]. An [ExtendedAppointment] (constructed from the [Appointment]) will be persisted on disk.
     /// In case the locator for the given appointment can be found in the cache (meaning the appointment has been
     /// triggered recently) the data will be passed to the [Responder] straightaway (modulo it being valid).
-    pub(crate) fn add_appointment(
+    pub(crate) async fn add_appointment(
         &self,
         appointment: Appointment,
         user_signature: String,
@@ -366,7 +367,8 @@ impl Watcher {
         {
             // Appointments that were triggered in blocks held in the cache
             Some(dispute_tx) => {
-                self.store_triggered_appointment(uuid, &extended_appointment, user_id, dispute_tx);
+                self.store_triggered_appointment(uuid, &extended_appointment, user_id, dispute_tx)
+                    .await;
             }
             // Regular appointments that have not been triggered (or, at least, not recently)
             None => {
@@ -439,7 +441,7 @@ impl Watcher {
     ///
     /// If the appointment is rejected by the [Responder] (i.e. for being invalid), the data is wiped
     /// from the database but the slot is not freed.
-    fn store_triggered_appointment(
+    async fn store_triggered_appointment(
         &self,
         uuid: UUID,
         appointment: &ExtendedAppointment,
@@ -460,11 +462,11 @@ impl Watcher {
                     .store_appointment(uuid, appointment)
                     .unwrap();
 
-                if let ConfirmationStatus::Rejected(reason) = self.responder.handle_breach(
-                    uuid,
-                    Breach::new(dispute_tx.clone(), penalty_tx),
-                    user_id,
-                ) {
+                if let ConfirmationStatus::Rejected(reason) = self
+                    .responder
+                    .handle_breach(uuid, Breach::new(dispute_tx.clone(), penalty_tx), user_id)
+                    .await
+                {
                     // DISCUSS: We could either free the slots or keep it occupied as if this was misbehavior.
                     // Keeping it for now.
                     log::warn!("Appointment bounced in the Responder. Reason: {:?}", reason);
@@ -814,11 +816,11 @@ impl chain::Listen for Watcher {
                     uuid
                 );
 
-                if let ConfirmationStatus::Rejected(_) = self.responder.handle_breach(
+                if let ConfirmationStatus::Rejected(_) = block_on(self.responder.handle_breach(
                     uuid,
                     breach,
                     self.appointments.lock().unwrap()[&uuid].user_id,
-                ) {
+                )) {
                     appointments_to_delete.insert(uuid);
                 } else {
                     delivered_appointments.insert(uuid);
@@ -1081,6 +1083,7 @@ mod tests {
             let user_sig = cryptography::sign(&appointment.serialize(), &user_sk).unwrap();
             watcher
                 .add_appointment(appointment.clone(), user_sig.clone())
+                .await
                 .unwrap();
         }
 
@@ -1147,6 +1150,7 @@ mod tests {
             let user_sig = cryptography::sign(&appointment.serialize(), &user_sk).unwrap();
             let (receipt, slots, expiry) = watcher
                 .add_appointment(appointment.clone(), user_sig.clone())
+                .await
                 .unwrap();
 
             assert_appointment_added(slots, SLOTS - 1, expiry, receipt, &user_sig, tower_id);
@@ -1160,6 +1164,7 @@ mod tests {
         let user2_sig = cryptography::sign(&appointment.serialize(), &user2_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(appointment.clone(), user2_sig.clone())
+            .await
             .unwrap();
 
         assert_appointment_added(slots, SLOTS - 1, expiry, receipt, &user2_sig, tower_id);
@@ -1185,6 +1190,7 @@ mod tests {
             cryptography::sign(&triggered_appointment.inner.serialize(), &user_sk).unwrap();
         watcher
             .add_appointment(triggered_appointment.inner.clone(), signature.clone())
+            .await
             .unwrap();
 
         let breach = get_random_breach();
@@ -1194,7 +1200,9 @@ mod tests {
             user_id,
             ConfirmationStatus::InMempoolSince(chain.get_block_count()),
         );
-        let receipt = watcher.add_appointment(triggered_appointment.inner, signature);
+        let receipt = watcher
+            .add_appointment(triggered_appointment.inner, signature)
+            .await;
 
         assert!(matches!(
             receipt,
@@ -1209,6 +1217,7 @@ mod tests {
             cryptography::sign(&appointment_in_cache.inner.serialize(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(appointment_in_cache.inner.clone(), user_sig.clone())
+            .await
             .unwrap();
 
         // The appointment should have been accepted, slots should have been decreased, and data should have been deleted from
@@ -1242,6 +1251,7 @@ mod tests {
             cryptography::sign(&invalid_appointment.inner.serialize(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(invalid_appointment.inner.clone(), user_sig.clone())
+            .await
             .unwrap();
 
         assert_appointment_added(slots, SLOTS - 4, expiry, receipt, &user_sig, tower_id);
@@ -1269,6 +1279,7 @@ mod tests {
         let user_sig = cryptography::sign(&invalid_appointment.serialize(), &user_sk).unwrap();
         let (receipt, slots, expiry) = watcher
             .add_appointment(invalid_appointment, user_sig.clone())
+            .await
             .unwrap();
 
         assert_appointment_added(slots, SLOTS - 4, expiry, receipt, &user_sig, tower_id);
@@ -1287,7 +1298,9 @@ mod tests {
         let user3_sig = String::from_utf8((0..65).collect()).unwrap();
 
         assert!(matches!(
-            watcher.add_appointment(appointment.clone(), user3_sig),
+            watcher
+                .add_appointment(appointment.clone(), user3_sig)
+                .await,
             Err(AddAppointmentFailure::AuthenticationFailure)
         ));
         // Data should not be in the database
@@ -1312,7 +1325,7 @@ mod tests {
         let new_app_sig = cryptography::sign(&new_appointment.serialize(), &user_sk).unwrap();
 
         assert!(matches!(
-            watcher.add_appointment(new_appointment, new_app_sig),
+            watcher.add_appointment(new_appointment, new_app_sig).await,
             Err(AddAppointmentFailure::NotEnoughSlots)
         ));
         // Data should not be in the database
@@ -1332,7 +1345,7 @@ mod tests {
             .subscription_expiry = START_HEIGHT as u32;
 
         assert!(matches!(
-            watcher.add_appointment(appointment, user2_sig),
+            watcher.add_appointment(appointment, user2_sig).await,
             Err(AddAppointmentFailure::SubscriptionExpired { .. })
         ));
         // Data should not be in the database
@@ -1419,7 +1432,9 @@ mod tests {
 
         // Valid triggered appointments should be accepted by the Responder
         assert_eq!(
-            watcher.store_triggered_appointment(uuid, &appointment, user_id, &dispute_tx),
+            watcher
+                .store_triggered_appointment(uuid, &appointment, user_id, &dispute_tx)
+                .await,
             TriggeredAppointment::Accepted,
         );
         // In this case the appointment is kept in the Responder and, therefore, in the database
@@ -1439,7 +1454,9 @@ mod tests {
         let (uuid, appointment) =
             generate_dummy_appointment_with_user(user_id, Some(&dispute_tx.txid()));
         assert_eq!(
-            watcher.store_triggered_appointment(uuid, &appointment, user_id, &dispute_tx),
+            watcher
+                .store_triggered_appointment(uuid, &appointment, user_id, &dispute_tx)
+                .await,
             TriggeredAppointment::Rejected,
         );
         // In this case the appointment is not kept in the Responder nor in the database
@@ -1454,7 +1471,9 @@ mod tests {
         // (the same applies to invalid formatted transactions)
         let uuid = generate_uuid();
         assert_eq!(
-            watcher.store_triggered_appointment(uuid, &appointment, user_id, &get_random_tx()),
+            watcher
+                .store_triggered_appointment(uuid, &appointment, user_id, &get_random_tx())
+                .await,
             TriggeredAppointment::Invalid,
         );
         // The appointment is not kept anywhere
@@ -1488,6 +1507,7 @@ mod tests {
                 appointment.clone(),
                 cryptography::sign(&appointment.serialize(), &user_sk).unwrap(),
             )
+            .await
             .unwrap();
 
         let message = format!("get appointment {}", appointment.locator);
@@ -1889,10 +1909,12 @@ mod tests {
         let user_sig = cryptography::sign(&appointment.inner.serialize(), &user_sk).unwrap();
         watcher
             .add_appointment(appointment.inner.clone(), user_sig)
+            .await
             .unwrap();
         let user2_sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
         watcher
             .add_appointment(appointment.inner.clone(), user2_sig)
+            .await
             .unwrap();
 
         watcher
@@ -1955,7 +1977,10 @@ mod tests {
         let appointment = generate_dummy_appointment(Some(&dispute_tx.txid()));
         let sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
         let uuid = UUID::new(appointment.locator(), user2_id);
-        watcher.add_appointment(appointment.inner, sig).unwrap();
+        watcher
+            .add_appointment(appointment.inner, sig)
+            .await
+            .unwrap();
 
         assert!(watcher.appointments.lock().unwrap().contains_key(&uuid));
 
@@ -1993,7 +2018,10 @@ mod tests {
         let appointment = generate_dummy_appointment(Some(&dispute_tx.txid()));
         let sig = cryptography::sign(&appointment.inner.serialize(), &user2_sk).unwrap();
         let uuid = UUID::new(appointment.locator(), user2_id);
-        watcher.add_appointment(appointment.inner, sig).unwrap();
+        watcher
+            .add_appointment(appointment.inner, sig)
+            .await
+            .unwrap();
 
         // Set the carrier response
         *watcher.responder.get_carrier().lock().unwrap() = create_carrier(
@@ -2039,6 +2067,7 @@ mod tests {
         let uuid = UUID::new(appointment.locator(), user2_id);
         watcher
             .add_appointment(appointment.inner.clone(), sig)
+            .await
             .unwrap();
 
         watcher.block_connected(

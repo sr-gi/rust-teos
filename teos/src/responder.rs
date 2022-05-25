@@ -1,5 +1,6 @@
 //! Logic related to the Responder, the components in charge of making sure breaches get properly punished.
 
+use futures::executor::block_on;
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::sync::{Arc, Mutex};
@@ -177,7 +178,7 @@ impl Responder {
     ///
     /// Breaches can either be added to the [Responder] in the form of a [TransactionTracker] if the [penalty transaction](Breach::penalty_tx)
     /// is accepted by the `bitcoind` or rejected otherwise.
-    pub(crate) fn handle_breach(
+    pub(crate) async fn handle_breach(
         &self,
         uuid: UUID,
         breach: Breach,
@@ -193,7 +194,8 @@ impl Responder {
             .carrier
             .lock()
             .unwrap()
-            .send_transaction(&breach.penalty_tx);
+            .send_transaction(&breach.penalty_tx)
+            .await;
         if !matches!(status, ConfirmationStatus::Rejected { .. }) {
             self.add_tracker(uuid, breach, user_id, status);
         }
@@ -365,7 +367,7 @@ impl Responder {
     /// otherwise, we could potentially try to rebroadcast again while processing the upcoming reorged blocks (if the tx hits [CONFIRMATIONS_BEFORE_RETRY]).
     ///
     /// Returns a tuple with two maps, one containing the trackers that where successfully rebroadcast and another one containing the ones that were rejected.
-    fn rebroadcast(
+    async fn rebroadcast(
         &self,
         txs: HashMap<UUID, (Transaction, Option<Transaction>)>,
     ) -> (HashMap<UUID, ConfirmationStatus>, HashSet<UUID>) {
@@ -378,15 +380,19 @@ impl Responder {
         for (uuid, (penalty_tx, dispute_tx)) in txs.into_iter() {
             let status = if let Some(dispute_tx) = dispute_tx {
                 // The tracker was reorged out, and the dispute may potentially not be in the chain anymore.
-                if carrier.get_block_hash_for_tx(&dispute_tx.txid()).is_some() {
+                if carrier
+                    .get_block_hash_for_tx(&dispute_tx.txid())
+                    .await
+                    .is_some()
+                {
                     // Dispute tx is on chain, so we only need to care about the penalty
-                    carrier.send_transaction(&penalty_tx)
+                    carrier.send_transaction(&penalty_tx).await
                 } else {
                     // Dispute tx has also been reorged out, meaning that both transactions need to be broadcast.
                     // DISCUSS: For lightning transactions, if the dispute has been reorged the penalty cannot make it to the network.
                     // If we keep this general, the dispute can simply be a trigger and the penalty doesn't necessarily have to spend from it.
                     // We'll keel it lightning specific, at least for now.
-                    let status = carrier.send_transaction(&dispute_tx);
+                    let status = carrier.send_transaction(&dispute_tx).await;
                     if let ConfirmationStatus::Rejected(e) = status {
                         log::error!(
                         "Reorged dispute transaction rejected during rebroadcast: {} (reason: {:?})",
@@ -396,7 +402,7 @@ impl Responder {
                         status
                     } else {
                         // The dispute was accepted, so we can rebroadcast the penalty.
-                        carrier.send_transaction(&penalty_tx)
+                        carrier.send_transaction(&penalty_tx).await
                     }
                 }
             } else {
@@ -405,7 +411,7 @@ impl Responder {
                     "Penalty transaction has missed many confirmations: {}",
                     penalty_tx.txid()
                 );
-                carrier.send_transaction(&penalty_tx)
+                carrier.send_transaction(&penalty_tx).await
             };
 
             if let ConfirmationStatus::Rejected(_) = status {
@@ -522,7 +528,8 @@ impl chain::Listen for Responder {
             );
 
             // Rebroadcast those transactions that need to
-            let (_, rejected_trackers) = self.rebroadcast(self.get_txs_to_rebroadcast(height));
+            let (_, rejected_trackers) =
+                block_on(self.rebroadcast(self.get_txs_to_rebroadcast(height)));
             // Delete trackers rejected during rebroadcast
             let trackers_to_delete_gk = rejected_trackers
                 .iter()
@@ -722,8 +729,8 @@ mod tests {
         assert_eq!(responder, another_r);
     }
 
-    #[test]
-    fn test_handle_breach_delivered() {
+    #[tokio::test]
+    async fn test_handle_breach_delivered() {
         let start_height = START_HEIGHT as u32;
         let responder = init_responder(MockedServerQuery::Regular);
 
@@ -735,7 +742,7 @@ mod tests {
         let penalty_txid = breach.penalty_tx.txid();
 
         assert_eq!(
-            responder.handle_breach(uuid, breach, user_id),
+            responder.handle_breach(uuid, breach, user_id).await,
             ConfirmationStatus::InMempoolSince(start_height)
         );
         assert!(responder.trackers.lock().unwrap().contains_key(&uuid));
@@ -753,7 +760,9 @@ mod tests {
         // passed twice, the receipt corresponding to the first breach will be handed back.
         let another_breach = get_random_breach();
         assert_eq!(
-            responder.handle_breach(uuid, another_breach.clone(), user_id),
+            responder
+                .handle_breach(uuid, another_breach.clone(), user_id)
+                .await,
             ConfirmationStatus::InMempoolSince(start_height)
         );
 
@@ -769,8 +778,8 @@ mod tests {
             .contains_key(&another_breach.penalty_tx.txid()));
     }
 
-    #[test]
-    fn test_handle_breach_rejected() {
+    #[tokio::test]
+    async fn test_handle_breach_rejected() {
         let responder = init_responder(MockedServerQuery::Error(
             rpc_errors::RPC_VERIFY_ERROR as i64,
         ));
@@ -781,7 +790,7 @@ mod tests {
         let penalty_txid = breach.penalty_tx.txid();
 
         assert_eq!(
-            responder.handle_breach(uuid, breach, user_id),
+            responder.handle_breach(uuid, breach, user_id).await,
             ConfirmationStatus::Rejected(rpc_errors::RPC_VERIFY_ERROR)
         );
         assert!(!responder.trackers.lock().unwrap().contains_key(&uuid));
@@ -1242,8 +1251,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rebroadcast_accepted() {
+    #[tokio::test]
+    async fn test_rebroadcast_accepted() {
         // This test positive rebroadcast cases, including reorgs. However, complex reorg logic is not tested here, it will need a
         // dedicated test (against bitcoind, not mocked).
         let responder = init_responder(MockedServerQuery::Regular);
@@ -1300,15 +1309,16 @@ mod tests {
         }
 
         // Check all are accepted
-        let (accepted, rejected) =
-            responder.rebroadcast(responder.get_txs_to_rebroadcast(current_height));
+        let (accepted, rejected) = responder
+            .rebroadcast(responder.get_txs_to_rebroadcast(current_height))
+            .await;
         let accepted_uuids: HashSet<UUID> = accepted.keys().cloned().collect();
         assert_eq!(accepted_uuids, need_rebroadcast);
         assert!(rejected.is_empty());
     }
 
-    #[test]
-    fn test_rebroadcast_rejected() {
+    #[tokio::test]
+    async fn test_rebroadcast_rejected() {
         // This test negative rebroadcast cases, including reorgs. However, complex reorg logic is not tested here, it will need a
         // dedicated test (against bitcoind, not mocked).
         let responder = init_responder(MockedServerQuery::Error(
@@ -1367,8 +1377,9 @@ mod tests {
         }
 
         // Check all are rejected
-        let (accepted, rejected) =
-            responder.rebroadcast(responder.get_txs_to_rebroadcast(current_height));
+        let (accepted, rejected) = responder
+            .rebroadcast(responder.get_txs_to_rebroadcast(current_height))
+            .await;
         assert_eq!(rejected, need_rebroadcast);
         assert!(accepted.is_empty());
     }

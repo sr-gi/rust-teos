@@ -10,8 +10,9 @@
 use rand::Rng;
 use std::convert::TryInto;
 use std::ops::Deref;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use tokio::sync::Notify;
 
 use jsonrpc_http_server::jsonrpc_core::error::ErrorCode as JsonRpcErrorCode;
 use jsonrpc_http_server::jsonrpc_core::{Error as JsonRpcError, IoHandler, Params, Value};
@@ -411,7 +412,7 @@ pub(crate) fn create_carrier(query: MockedServerQuery, height: u32) -> Carrier {
         MockedServerQuery::Error(x) => BitcoindMock::new(MockOptions::with_error(x)),
     };
     let bitcoin_cli = Arc::new(BitcoindClient::new(bitcoind_mock.url(), Auth::None).unwrap());
-    let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+    let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
     start_server(bitcoind_mock);
 
     Carrier::new(bitcoin_cli, bitcoind_reachable, height)
@@ -424,7 +425,7 @@ pub(crate) fn create_responder(
     server_url: &str,
 ) -> Responder {
     let bitcoin_cli = Arc::new(BitcoindClient::new(server_url, Auth::None).unwrap());
-    let bitcoind_reachable = Arc::new((Mutex::new(true), Condvar::new()));
+    let bitcoind_reachable = Arc::new((Mutex::new(true), Notify::new()));
     let carrier = Carrier::new(bitcoin_cli, bitcoind_reachable, tip.deref().height);
 
     Responder::new(carrier, gatekeeper, dbm)
@@ -506,7 +507,7 @@ pub(crate) async fn create_api_with_config(api_config: ApiConfig) -> Arc<Interna
     )
     .await;
 
-    let bitcoind_reachable = Arc::new((Mutex::new(api_config.bitcoind_reachable), Condvar::new()));
+    let bitcoind_reachable = Arc::new((Mutex::new(api_config.bitcoind_reachable), Notify::new()));
     let (shutdown_trigger, _) = triggered::trigger();
     Arc::new(InternalAPI::new(
         Arc::new(watcher),

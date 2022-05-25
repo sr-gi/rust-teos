@@ -3,8 +3,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
+use tokio::sync::Notify;
 use tokio::task;
 use tonic::transport::Server;
 
@@ -127,7 +128,7 @@ async fn main() {
     {
         Ok(client) => (
             Arc::new(client),
-            Arc::new((Mutex::new(true), Condvar::new())),
+            Arc::new((Mutex::new(true), Notify::new())),
         ),
         Err(e) => {
             let e_msg = match e.kind() {

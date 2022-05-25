@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 # General
+async-recursion = "1.0.0"
+futures = "0.3"
 hex = { version = "0.4.3", features = [ "serde" ] }
 home = "0.5.3"
 log = "0.4"
