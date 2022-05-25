@@ -2,6 +2,7 @@
 
 use async_recursion::async_recursion;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -23,9 +24,9 @@ pub struct Carrier {
     bitcoind_reachable: Arc<(Mutex<bool>, Notify)>,
     /// A map of receipts already issued by the [Carrier].
     /// Used to prevent potentially re-sending the same transaction over and over.
-    issued_receipts: HashMap<Txid, ConfirmationStatus>,
+    issued_receipts: Mutex<HashMap<Txid, ConfirmationStatus>>,
     /// The last known block header.
-    block_height: u32,
+    block_height: AtomicU32,
 }
 
 impl Carrier {
@@ -38,22 +39,23 @@ impl Carrier {
         Carrier {
             bitcoin_cli,
             bitcoind_reachable,
-            issued_receipts: HashMap::new(),
-            block_height: last_known_block_height,
+            issued_receipts: Mutex::new(HashMap::new()),
+            block_height: AtomicU32::new(last_known_block_height),
         }
     }
 
     /// Clears the receipts cached by the [Carrier]. Should be called periodically to prevent it from
     /// growing unbounded.
-    pub(crate) fn clear_receipts(&mut self) {
-        if !self.issued_receipts.is_empty() {
-            self.issued_receipts = HashMap::new()
+    pub(crate) fn clear_receipts(&self) {
+        let mut issued_receipts = self.issued_receipts.lock().unwrap();
+        if !issued_receipts.is_empty() {
+            *issued_receipts = HashMap::new()
         }
     }
 
     /// Updates the last known block height by the [Carrier].
-    pub(crate) fn update_height(&mut self, height: u32) {
-        self.block_height = height
+    pub(crate) fn update_height(&self, height: u32) {
+        self.block_height.store(height, Ordering::Release);
     }
 
     /// Hangs the process until bitcoind is reachable. If bitcoind is already reachable it just passes trough.
@@ -74,10 +76,10 @@ impl Carrier {
     ///
     /// Returns a [ConfirmationStatus] indicating whether the transaction was accepted by the node or not.
     #[async_recursion]
-    pub(crate) async fn send_transaction(&mut self, tx: &Transaction) -> ConfirmationStatus {
+    pub(crate) async fn send_transaction(&self, tx: &Transaction) -> ConfirmationStatus {
         self.hang_until_bitcoind_reachable().await;
 
-        if let Some(receipt) = self.issued_receipts.get(&tx.txid()) {
+        if let Some(receipt) = self.issued_receipts.lock().unwrap().get(&tx.txid()) {
             log::info!("Transaction already sent: {}", tx.txid());
             return *receipt;
         }
@@ -88,7 +90,7 @@ impl Carrier {
                 // Here the transaction could, potentially, have been in mempool before the current height.
                 // This shouldn't really matter though.
                 log::info!("Transaction successfully delivered: {}", tx.txid());
-                ConfirmationStatus::InMempoolSince(self.block_height)
+                ConfirmationStatus::InMempoolSince(self.block_height.load(Ordering::Relaxed))
             }
             Err(JsonRpcError(RpcError(rpcerr))) => match rpcerr.code {
                 // Since we're pushing a raw transaction to the network we can face several rejections
@@ -136,7 +138,10 @@ impl Carrier {
             }
         };
 
-        self.issued_receipts.insert(tx.txid(), receipt);
+        self.issued_receipts
+            .lock()
+            .unwrap()
+            .insert(tx.txid(), receipt);
 
         receipt
     }

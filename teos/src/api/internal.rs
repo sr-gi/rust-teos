@@ -1,4 +1,3 @@
-use futures::executor::block_on;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tonic::{Code, Request, Response, Status};
@@ -105,10 +104,10 @@ impl PublicTowerServices for Arc<InternalAPI> {
         );
         let locator = appointment.locator;
 
-        match block_on(
-            self.watcher
-                .add_appointment(appointment, req_data.signature),
-        ) {
+        match self
+            .watcher
+            .add_appointment(appointment, req_data.signature)
+        {
             Ok((receipt, available_slots, subscription_expiry)) => {
                 Ok(Response::new(msgs::AddAppointmentResponse {
                     locator: locator.serialize(),

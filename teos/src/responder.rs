@@ -132,7 +132,7 @@ pub struct Responder {
     /// A map between [Txid]s and [UUID]s.
     tx_tracker_map: Mutex<HashMap<Txid, HashSet<UUID>>>,
     /// A [Carrier] instance. Data is sent to the `bitcoind` through it.
-    carrier: Mutex<Carrier>,
+    carrier: Arc<Carrier>,
     /// A [Gatekeeper] instance. Data regarding users is requested to it.
     gatekeeper: Arc<Gatekeeper>,
     /// A [DBM] (database manager) instance. Used to persist tracker data into disk.
@@ -156,7 +156,7 @@ impl Responder {
         }
 
         Responder {
-            carrier: Mutex::new(carrier),
+            carrier: Arc::new(carrier),
             trackers: Mutex::new(trackers),
             tx_tracker_map: Mutex::new(tx_tracker_map),
             dbm,
@@ -190,12 +190,7 @@ impl Responder {
             return tracker.status;
         }
 
-        let status = self
-            .carrier
-            .lock()
-            .unwrap()
-            .send_transaction(&breach.penalty_tx)
-            .await;
+        let status = self.carrier.send_transaction(&breach.penalty_tx).await;
         if !matches!(status, ConfirmationStatus::Rejected { .. }) {
             self.add_tracker(uuid, breach, user_id, status);
         }
@@ -375,24 +370,23 @@ impl Responder {
         let mut rejected = HashSet::new();
 
         let mut trackers = self.trackers.lock().unwrap();
-        let mut carrier = self.carrier.lock().unwrap();
-
         for (uuid, (penalty_tx, dispute_tx)) in txs.into_iter() {
             let status = if let Some(dispute_tx) = dispute_tx {
                 // The tracker was reorged out, and the dispute may potentially not be in the chain anymore.
-                if carrier
+                if self
+                    .carrier
                     .get_block_hash_for_tx(&dispute_tx.txid())
                     .await
                     .is_some()
                 {
                     // Dispute tx is on chain, so we only need to care about the penalty
-                    carrier.send_transaction(&penalty_tx).await
+                    self.carrier.send_transaction(&penalty_tx).await
                 } else {
                     // Dispute tx has also been reorged out, meaning that both transactions need to be broadcast.
                     // DISCUSS: For lightning transactions, if the dispute has been reorged the penalty cannot make it to the network.
                     // If we keep this general, the dispute can simply be a trigger and the penalty doesn't necessarily have to spend from it.
                     // We'll keel it lightning specific, at least for now.
-                    let status = carrier.send_transaction(&dispute_tx).await;
+                    let status = self.carrier.send_transaction(&dispute_tx).await;
                     if let ConfirmationStatus::Rejected(e) = status {
                         log::error!(
                         "Reorged dispute transaction rejected during rebroadcast: {} (reason: {:?})",
@@ -402,7 +396,7 @@ impl Responder {
                         status
                     } else {
                         // The dispute was accepted, so we can rebroadcast the penalty.
-                        carrier.send_transaction(&penalty_tx).await
+                        self.carrier.send_transaction(&penalty_tx).await
                     }
                 }
             } else {
@@ -411,7 +405,7 @@ impl Responder {
                     "Penalty transaction has missed many confirmations: {}",
                     penalty_tx.txid()
                 );
-                carrier.send_transaction(&penalty_tx).await
+                self.carrier.send_transaction(&penalty_tx).await
             };
 
             if let ConfirmationStatus::Rejected(_) = status {
@@ -497,7 +491,7 @@ impl chain::Listen for Responder {
     /// rebroadcasting is performed for those that have missed too many.
     fn block_connected(&self, block: &bitcoin::Block, height: u32) {
         log::info!("New block received: {}", block.header.block_hash());
-        self.carrier.lock().unwrap().update_height(height);
+        self.carrier.update_height(height);
 
         if self.trackers.lock().unwrap().len() > 0 {
             // Complete those appointments that are due at this height
@@ -544,7 +538,7 @@ impl chain::Listen for Responder {
             );
 
             // Remove all receipts created in this block
-            self.carrier.lock().unwrap().clear_receipts();
+            self.carrier.clear_receipts();
 
             if self.trackers.lock().unwrap().is_empty() {
                 log::info!("No more pending trackers");
@@ -555,7 +549,7 @@ impl chain::Listen for Responder {
     /// Handles reorgs in the [Responder].
     fn block_disconnected(&self, header: &BlockHeader, height: u32) {
         log::warn!("Block disconnected: {}", header.block_hash());
-        self.carrier.lock().unwrap().update_height(height);
+        self.carrier.update_height(height);
 
         for tracker in self.trackers.lock().unwrap().values_mut() {
             // The transaction has been unconfirmed. Flag it as reorged out so we can rebroadcast it.

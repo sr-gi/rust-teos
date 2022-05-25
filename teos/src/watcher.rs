@@ -9,6 +9,7 @@ use std::fmt;
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use bitcoin::hash_types::BlockHash;
 use bitcoin::secp256k1::SecretKey;
@@ -319,7 +320,7 @@ impl Watcher {
     /// monitored by the [Watcher]. An [ExtendedAppointment] (constructed from the [Appointment]) will be persisted on disk.
     /// In case the locator for the given appointment can be found in the cache (meaning the appointment has been
     /// triggered recently) the data will be passed to the [Responder] straightaway (modulo it being valid).
-    pub(crate) async fn add_appointment(
+    pub(crate) fn add_appointment(
         &self,
         appointment: Appointment,
         user_signature: String,
@@ -367,8 +368,15 @@ impl Watcher {
         {
             // Appointments that were triggered in blocks held in the cache
             Some(dispute_tx) => {
-                self.store_triggered_appointment(uuid, &extended_appointment, user_id, dispute_tx)
+                thread::spawn(|| {
+                    self.store_triggered_appointment(
+                        uuid,
+                        &extended_appointment,
+                        user_id,
+                        dispute_tx,
+                    )
                     .await;
+                });
             }
             // Regular appointments that have not been triggered (or, at least, not recently)
             None => {
