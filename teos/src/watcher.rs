@@ -8,6 +8,7 @@ use std::fmt;
 use std::iter::FromIterator;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use bitcoin::hash_types::BlockHash;
 use bitcoin::secp256k1::SecretKey;
@@ -366,7 +367,14 @@ impl Watcher {
         {
             // Appointments that were triggered in blocks held in the cache
             Some(dispute_tx) => {
-                self.store_triggered_appointment(uuid, &extended_appointment, user_id, dispute_tx);
+                thread::spawn(|| {
+                    self.store_triggered_appointment(
+                        uuid,
+                        &extended_appointment,
+                        user_id,
+                        dispute_tx,
+                    );
+                });
             }
             // Regular appointments that have not been triggered (or, at least, not recently)
             None => {
