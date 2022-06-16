@@ -9,6 +9,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .field_attribute("encrypted_blob", "#[serde(with = \"hex::serde\")]")
         .field_attribute("tx", "#[serde(with = \"hex::serde\")]")
         .field_attribute(
+            "dispute_txid",
+            "#[serde(serialize_with = \"crate::ser::serialize_txid_be\")]",
+        )
+        .field_attribute(
+            "penalty_txid",
+            "#[serde(serialize_with = \"crate::ser::serialize_txid_be\")]",
+        )
+        .field_attribute("penalty_rawtx", "#[serde(with = \"hex::serde\")]")
+        .field_attribute(
             "GetAppointmentResponse.status",
             "#[serde(with = \"crate::ser::serde_status\")]",
         )

@@ -15,6 +15,15 @@ where
     seq.end()
 }
 
+pub fn serialize_txid_be<S>(v: &[u8], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut v = v.to_owned();
+    v.reverse();
+    hex::serialize(v, s)
+}
+
 pub mod serde_status {
     use serde::de::{self, Deserializer};
     use serde::ser::Serializer;
