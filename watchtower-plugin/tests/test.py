@@ -45,7 +45,6 @@ def test_watchtower(node_factory, bitcoind, teosd):
     # Now l1 cheats
     dispute_txid = bitcoind.rpc.sendrawtransaction(tx)
     locator = change_endianness(dispute_txid[32:])
-    print("LOCATOR", locator)
 
     # Make sure l2's normal penalty_tx doesn't reach the network
     l2.daemon.rpcproxy.mock_rpc("sendrawtransaction", lambda: None)
