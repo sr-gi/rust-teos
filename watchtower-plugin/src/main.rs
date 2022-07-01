@@ -131,6 +131,26 @@ async fn register(
     Ok(json!(receipt))
 }
 
+/// Gets the latest registration receipt from the client to a given tower (if it exists).
+///
+/// This is pulled from the database
+async fn get_registration_receipt(
+    plugin: Plugin<Arc<Mutex<WTClient>>>,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let tower_id = TowerId::try_from(v).map_err(|x| anyhow!(x))?;
+    let state = plugin.state().lock().unwrap();
+
+    let response = state.get_registration_receipt(tower_id).map_err(|_| {
+        anyhow!(
+            "Cannot find {} within the known towers. Have you registered?",
+            tower_id
+        )
+    })?;
+
+    Ok(json!(response))
+}
+
 /// Gets information about an appointment from the tower.
 async fn get_appointment(
     plugin: Plugin<Arc<Mutex<WTClient>>>,
@@ -176,6 +196,36 @@ async fn get_appointment(
         }
         to_cln_error(e)
     })?;
+
+    Ok(json!(response))
+}
+
+/// Gets an appointment receipt from the client given a tower_id and a locator (if it exists).
+///
+/// This is pulled from the database
+async fn get_appointment_receipt(
+    plugin: Plugin<Arc<Mutex<WTClient>>>,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let params = GetAppointmentParams::try_from(v).map_err(|x| anyhow!(x))?;
+    let state = plugin.state().lock().unwrap();
+
+    let response = state
+        .get_appointment_receipt(params.tower_id, params.locator)
+        .map_err(|_| {
+            if state.towers.contains_key(&params.tower_id) {
+                anyhow!(
+                    "Cannot find {} within {}. Did you send that appointment?",
+                    params.locator,
+                    params.tower_id
+                )
+            } else {
+                anyhow!(
+                    "Cannot find {} within the known towers. Have you registered?",
+                    params.tower_id
+                )
+            }
+        })?;
 
     Ok(json!(response))
 }
@@ -236,6 +286,29 @@ async fn retry_tower(
             .send(tower_id)
             .map_err(|e| anyhow!(e))?;
         Ok(json!(format!("Retrying {}", tower_id)))
+    } else {
+        Err(anyhow!("Unknown tower {}", tower_id))
+    }
+}
+
+/// Forgets about a tower wiping out all local data associated to it.
+async fn abandon_tower(
+    plugin: Plugin<Arc<Mutex<WTClient>>>,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let tower_id = TowerId::try_from(v).map_err(|e| anyhow!(e))?;
+    let mut state = plugin.state().lock().unwrap();
+    if let Some(tower) = state.towers.get_mut(&tower_id) {
+        if tower.status == TowerStatus::TemporaryUnreachable {
+            tower.status = TowerStatus::Abandoned;
+            return Err(anyhow!(
+                "{} is being retried. Flagging it to be abandoned",
+                tower_id
+            ));
+        }
+
+        state.remove_tower(tower_id).unwrap();
+        Ok(json!(format!("{} successfully abandoned", tower_id)))
     } else {
         Err(anyhow!("Unknown tower {}", tower_id))
     }
@@ -402,11 +475,19 @@ async fn main() -> Result<(), Error> {
             "registertower",
             "Registers the client public key (user id) with the tower.",
             register,
+        ).rpcmethod(
+            "getregistrationreceipt",
+            "Gets the latest registration receipt given a tower id.",
+            get_registration_receipt,
         )
         .rpcmethod(
             "getappointment",
             "Gets appointment data from the tower given the tower id and the locator.",
             get_appointment,
+        ).rpcmethod(
+            "getappointmentreceipt",
+            "Gets a (local) appointment receipt given a tower id and an locator.",
+            get_appointment_receipt,
         )
         .rpcmethod("listtowers", "Lists all registered towers.", list_towers)
         .rpcmethod(
@@ -418,6 +499,11 @@ async fn main() -> Result<(), Error> {
             "retrytower",
             "Retries to send pending appointment to an unreachable tower.",
             retry_tower,
+        )
+        .rpcmethod(
+            "abandontower",
+            "Forgets about a tower and wipes all local data.",
+            abandon_tower,
         )
         .hook("commitment_revocation", on_commitment_revocation);
 

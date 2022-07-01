@@ -26,6 +26,7 @@ pub enum TowerStatus {
     Unreachable,
     SubscriptionError,
     Misbehaving,
+    Abandoned,
 }
 
 /// The status an appointment can be at.
@@ -60,6 +61,7 @@ impl fmt::Display for TowerStatus {
                 TowerStatus::Unreachable => "unreachable",
                 TowerStatus::SubscriptionError => "subscription error",
                 TowerStatus::Misbehaving => "misbehaving",
+                TowerStatus::Abandoned => "abandoned",
             }
         )
     }
@@ -84,6 +86,11 @@ impl TowerStatus {
     /// Whether there is a subscription issue with the tower.
     pub fn is_subscription_error(&self) -> bool {
         *self == TowerStatus::SubscriptionError
+    }
+
+    /// Whether the tower has been abandoned
+    pub fn is_abandoned(&self) -> bool {
+        *self == TowerStatus::Abandoned
     }
 }
 

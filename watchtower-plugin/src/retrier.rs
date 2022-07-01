@@ -36,10 +36,23 @@ impl Retrier {
 
         loop {
             let tower_id = unreachable_towers.recv().await.unwrap();
-            self.wt_client
-                .lock()
-                .unwrap()
-                .set_tower_status(tower_id, crate::TowerStatus::TemporaryUnreachable);
+            {
+                // Not start a retry if the tower is flagged to be abandoned
+                let mut wt_client = self.wt_client.lock().unwrap();
+                if wt_client
+                    .towers
+                    .get(&tower_id)
+                    .unwrap()
+                    .status
+                    .is_abandoned()
+                {
+                    log::info!("Abandoning {}", tower_id);
+                    println!("Abandoning {}", tower_id);
+                    wt_client.remove_tower(tower_id).unwrap();
+                    continue;
+                }
+                wt_client.set_tower_status(tower_id, crate::TowerStatus::TemporaryUnreachable);
+            }
 
             log::info!("Retrying tower {}", tower_id);
             match retry_notify(
@@ -67,15 +80,13 @@ impl Retrier {
                     // Notice we'll end up here after a permanent error. That is, either after finishing the backoff strategy
                     // unsuccessfully or by manually raising such an error (like when facing a tower misbehavior)
                     let mut wt_client = self.wt_client.lock().unwrap();
-                    if wt_client
-                        .towers
-                        .get(&tower_id)
-                        .unwrap()
-                        .status
-                        .is_unreachable()
-                    {
+                    let status = wt_client.towers.get(&tower_id).unwrap().status;
+                    if status.is_unreachable() {
                         log::warn!("Setting {} as unreachable", tower_id);
                         wt_client.set_tower_status(tower_id, crate::TowerStatus::Unreachable);
+                    } else if status.is_abandoned() {
+                        log::info!("Abandoning {}", tower_id);
+                        wt_client.remove_tower(tower_id).unwrap();
                     }
                 }
             }
@@ -86,6 +97,17 @@ impl Retrier {
         // Create a new scope so we can get all the data only locking the WTClient once.
         let (appointments, net_addr, user_sk) = {
             let wt_client = self.wt_client.lock().unwrap();
+            // Stop retrying if the tower was flagged to be abandoned
+            if wt_client
+                .towers
+                .get(&tower_id)
+                .unwrap()
+                .status
+                .is_abandoned()
+            {
+                return Err(Error::permanent("Tower was flagged to be abandoned"));
+            }
+
             let appointments = wt_client
                 .dbm
                 .lock()
@@ -410,7 +432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retry_misbehaving() {
+    async fn test_manage_retry_misbehaving() {
         let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
         let (tx, rx) = unbounded_channel();
         let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
@@ -469,6 +491,49 @@ mod tests {
             .status
             .is_misbehaving());
         api_mock.assert();
+
+        task.abort();
+        fs::remove_dir_all(tmp_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_manage_retry_abandoned() {
+        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let (tx, rx) = unbounded_channel();
+        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let server = MockServer::start();
+
+        // Add a tower with pending appointments
+        let (_, tower_pk) = cryptography::get_random_keypair();
+        let tower_id = TowerId(tower_pk);
+        let receipt = get_random_registration_receipt();
+        wt_client
+            .lock()
+            .unwrap()
+            .add_update_tower(tower_id, server.base_url(), &receipt)
+            .unwrap();
+
+        // Set the tower to abandoned
+        wt_client
+            .lock()
+            .unwrap()
+            .towers
+            .get_mut(&tower_id)
+            .unwrap()
+            .status = TowerStatus::Abandoned;
+
+        // Start the task and send the tower to the channel for retry
+        let wt_client_clone = wt_client.clone();
+        let task = tokio::spawn(async move {
+            Retrier::new(wt_client_clone, MAX_ELAPSED_TIME, MAX_INTERVAL_TIME)
+                .manage_retry(rx)
+                .await
+        });
+
+        // Send the id and check how it gets removed
+        tx.send(tower_id).unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!wt_client.lock().unwrap().towers.contains_key(&tower_id));
 
         task.abort();
         fs::remove_dir_all(tmp_path).await.unwrap();
@@ -712,6 +777,44 @@ mod tests {
             .unwrap()
             .invalid_appointments
             .contains(&appointment.locator));
+
+        fs::remove_dir_all(tmp_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_add_appointment_abandoned() {
+        let (_, tower_pk) = cryptography::get_random_keypair();
+        let tower_id = TowerId(tower_pk);
+        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+        ));
+        let server = MockServer::start();
+
+        // The tower we'd like to retry sending appointments to has to exist within the plugin
+        let receipt = get_random_registration_receipt();
+        wt_client
+            .lock()
+            .unwrap()
+            .add_update_tower(tower_id, server.base_url(), &receipt)
+            .unwrap();
+
+        // Set the tower to abandoned
+        wt_client
+            .lock()
+            .unwrap()
+            .towers
+            .get_mut(&tower_id)
+            .unwrap()
+            .status = TowerStatus::Abandoned;
+
+        // If there are no pending appointments the method will simply return
+        let r = Retrier::dummy(wt_client).add_appointment(tower_id).await;
+
+        assert_eq!(
+            r,
+            Err(Error::permanent("Tower was flagged to be abandoned"))
+        );
 
         fs::remove_dir_all(tmp_path).await.unwrap();
     }
