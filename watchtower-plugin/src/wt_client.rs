@@ -90,6 +90,7 @@ impl WTClient {
             TowerSummary::new(
                 tower_net_addr,
                 receipt.available_slots(),
+                receipt.subscription_start(),
                 receipt.subscription_expiry(),
             ),
         );
@@ -216,7 +217,8 @@ mod tests {
 
     use teos_common::test_utils::{
         generate_random_appointment, get_random_appointment_receipt,
-        get_random_registration_receipt, get_random_user_id,
+        get_random_registration_receipt, get_random_registration_receipt_with_expiry,
+        get_random_user_id,
     };
 
     #[tokio::test]
@@ -226,11 +228,12 @@ mod tests {
             WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await;
 
         // Adding a new tower will add a summary to towers and the full data to the
-        let receipt = get_random_registration_receipt();
+        let mut receipt = get_random_registration_receipt();
         let tower_id = get_random_user_id();
         let tower_info = TowerInfo::empty(
             "talaia.watch".into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
 
@@ -242,10 +245,12 @@ mod tests {
         assert_eq!(wt_client.load_tower_info(tower_id).unwrap(), tower_info);
 
         // Calling the method again with updated information should also updated the records in memory and the database
-        let receipt = get_random_registration_receipt();
+        receipt = get_random_registration_receipt_with_expiry(receipt.subscription_expiry() + 100);
+
         let updated_tower_info = TowerInfo::empty(
             "talaia.watch".into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         wt_client.add_update_tower(tower_id, updated_tower_info.net_addr.clone(), &receipt);
@@ -315,6 +320,7 @@ mod tests {
         let tower_info = TowerInfo::new(
             tower_net_addr.into(),
             registration_receipt.available_slots(),
+            registration_receipt.subscription_start(),
             registration_receipt.subscription_expiry(),
             HashMap::from([(locator, appointment_receipt.signature().unwrap())]),
             Vec::new(),
@@ -356,6 +362,7 @@ mod tests {
         let tower_info = TowerInfo::new(
             tower_net_addr.into(),
             registration_receipt.available_slots(),
+            registration_receipt.subscription_start(),
             registration_receipt.subscription_expiry(),
             HashMap::new(),
             vec![appointment.clone()],
@@ -433,6 +440,7 @@ mod tests {
         let tower_info = TowerInfo::new(
             tower_net_addr.into(),
             registration_receipt.available_slots(),
+            registration_receipt.subscription_start(),
             registration_receipt.subscription_expiry(),
             HashMap::new(),
             Vec::new(),

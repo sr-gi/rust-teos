@@ -10,7 +10,7 @@ use bitcoin::secp256k1::SecretKey;
 use teos_common::appointment::{Appointment, Locator};
 use teos_common::dbm::{DatabaseConnection, DatabaseManager, Error};
 use teos_common::receipts::{AppointmentReceipt, RegistrationReceipt};
-use teos_common::TowerId;
+use teos_common::{TowerId, UserId};
 
 use crate::{AppointmentStatus, MisbehaviorProof, TowerInfo, TowerStatus, TowerSummary};
 
@@ -18,8 +18,7 @@ const TABLES: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS towers (
     tower_id INT PRIMARY KEY,
     net_addr TEXT NOT NULL,
-    available_slots INT NOT NULL,
-    subscription_expiry INT NOT NULL
+    available_slots INT NOT NULL
 )",
     "CREATE TABLE IF NOT EXISTS appointments (
     locator INT PRIMARY KEY,
@@ -49,10 +48,12 @@ const TABLES: [&str; 8] = [
         ON DELETE CASCADE
 )",
     "CREATE TABLE IF NOT EXISTS registration_receipts (
-    tower_id INT PRIMARY KEY,
+    tower_id INT NOT NULL,
     available_slots INT NOT NULL,
+    subscription_start INT NOT NULL,
     subscription_expiry INT NOT NULL,
     signature BLOB NOT NULL,
+    PRIMARY KEY (tower_id, subscription_expiry),
     FOREIGN KEY(tower_id)
         REFERENCES towers(tower_id)
         ON DELETE CASCADE
@@ -139,24 +140,25 @@ impl DBM {
         .map_err(|_| Error::NotFound)
     }
 
-    /// Stores a tower record into the database.
+    /// Stores a tower record into the database alongside the corresponding registration receipt.
     pub fn store_tower_record(
-        &self,
+        &mut self,
         tower_id: TowerId,
         net_addr: &str,
         receipt: &RegistrationReceipt,
     ) -> Result<(), Error> {
-        let query =
-            "INSERT OR REPLACE INTO towers (tower_id, net_addr, available_slots, subscription_expiry) VALUES (?1, ?2, ?3, ?4)";
-        self.store_data(
-            query,
-            params![
-                tower_id.to_vec(),
-                net_addr,
-                receipt.available_slots(),
-                receipt.subscription_expiry()
-            ],
+        let tx = self.get_mut_connection().transaction().unwrap();
+        tx.execute(
+            "INSERT INTO towers (tower_id, net_addr, available_slots) VALUES (?1, ?2, ?3) ON CONFLICT (tower_id) DO UPDATE SET net_addr = ?2, available_slots = ?3",
+            params![tower_id.to_vec(), net_addr, receipt.available_slots()],
         )
+        .map_err( Error::Unknown)?;
+        // FIXME: This may need a guard. What if a tower returns the same end_time twice?
+        tx.execute(
+                "INSERT INTO registration_receipts (tower_id, available_slots, subscription_start, subscription_expiry, signature) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![tower_id.to_vec(), receipt.available_slots(), receipt.subscription_start(), receipt.subscription_expiry(), receipt.signature()]).map_err( Error::Unknown)?;
+
+        tx.commit().map_err(Error::Unknown)
     }
 
     /// Loads a tower record from the database.
@@ -167,17 +169,19 @@ impl DBM {
     pub fn load_tower_record(&self, tower_id: TowerId) -> Result<TowerInfo, Error> {
         let mut stmt = self
         .connection
-        .prepare("SELECT net_addr, available_slots, subscription_expiry FROM towers WHERE tower_id = ?")
+        .prepare("SELECT t.net_addr, t.available_slots, r.subscription_start, r.subscription_expiry FROM towers as t, registration_receipts as r WHERE t.tower_id = r.tower_id AND t.tower_id = ?1 AND r.subscription_expiry = (SELECT MAX(subscription_expiry) FROM registration_receipts WHERE tower_id = ?1)")
         .unwrap();
 
         let mut tower = stmt
             .query_row([tower_id.to_vec()], |row| {
                 let net_addr: String = row.get(0).unwrap();
                 let available_slots: u32 = row.get(1).unwrap();
-                let subscription_expiry: u32 = row.get(2).unwrap();
+                let subscription_start: u32 = row.get(2).unwrap();
+                let subscription_expiry: u32 = row.get(3).unwrap();
                 Ok(TowerInfo::new(
                     net_addr,
                     available_slots,
+                    subscription_start,
                     subscription_expiry,
                     self.load_appointment_receipts(tower_id),
                     self.load_appointments(tower_id, AppointmentStatus::Pending),
@@ -196,6 +200,35 @@ impl DBM {
         Ok(tower)
     }
 
+    /// Loads the latest registration receipt for a given tower.
+    ///
+    /// Latests is determined by the one with the `subscription_expiry` further into the future.
+    pub fn load_registration_receipt(
+        &self,
+        tower_id: TowerId,
+        user_id: UserId,
+    ) -> Result<RegistrationReceipt, Error> {
+        let mut stmt = self
+        .connection
+        .prepare("SELECT * FROM registration_receipts WHERE tower_id = ?1 AND subscription_expiry = (SELECT MAX(subscription_expiry) FROM registration_receipts WHERE tower_id = ?1)")
+        .unwrap();
+
+        let receipt = stmt
+            .query_row([tower_id.to_vec()], |row| {
+                let slots: u32 = row.get(1).unwrap();
+                let start: u32 = row.get(2).unwrap();
+                let expiry: u32 = row.get(3).unwrap();
+                let signature: String = row.get(4).unwrap();
+
+                Ok(RegistrationReceipt::with_signature(
+                    user_id, slots, start, expiry, signature,
+                ))
+            })
+            .map_err(|_| Error::NotFound)?;
+
+        Ok(receipt)
+    }
+
     /// Loads all tower records from the database.
     pub fn load_towers(&self) -> HashMap<TowerId, TowerSummary> {
         let mut towers = HashMap::new();
@@ -207,12 +240,24 @@ impl DBM {
             let tower_id = TowerId::from_slice(&raw_towerid).unwrap();
             let net_addr: String = row.get(1).unwrap();
             let available_slots: u32 = row.get(2).unwrap();
-            let subscription_expiry: u32 = row.get(3).unwrap();
+
+            let mut stmt = self
+            .connection
+            .prepare("SELECT subscription_start, subscription_expiry FROM registration_receipts WHERE tower_id = ?1 AND subscription_expiry = (SELECT MAX(subscription_expiry) FROM registration_receipts WHERE tower_id = ?1)")
+            .unwrap();
+            let (start, end) = stmt
+                .query_row([raw_towerid], |row| {
+                    let start: u32 = row.get(0).unwrap();
+                    let expiry: u32 = row.get(1).unwrap();
+                    Ok((start, expiry))
+                })
+                .unwrap();
 
             let mut tower = TowerSummary::with_appointments(
                 net_addr,
                 available_slots,
-                subscription_expiry,
+                start,
+                end,
                 self.load_appointment_locators(tower_id, AppointmentStatus::Pending),
                 self.load_appointment_locators(tower_id, AppointmentStatus::Invalid),
             );
@@ -536,7 +581,8 @@ mod tests {
     use super::*;
 
     use teos_common::test_utils::{
-        generate_random_appointment, get_random_registration_receipt, get_random_user_id,
+        generate_random_appointment, get_random_registration_receipt,
+        get_random_registration_receipt_with_expiry, get_random_user_id,
     };
 
     impl DBM {
@@ -567,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_store_load_tower_record() {
-        let dbm = DBM::in_memory().unwrap();
+        let mut dbm = DBM::in_memory().unwrap();
 
         // In order to add a tower record we need to associated registration receipt.
         let tower_id = get_random_user_id();
@@ -577,6 +623,7 @@ mod tests {
         let tower_info = TowerInfo::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
             HashMap::new(),
             Vec::new(),
@@ -587,6 +634,51 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(dbm.load_tower_record(tower_id).unwrap(), tower_info);
+    }
+
+    #[test]
+    fn test_load_registration_receipt() {
+        let mut dbm = DBM::in_memory().unwrap();
+
+        // Registration receipts are stored alongside tower records when the register command is called
+        let tower_id = get_random_user_id();
+        let net_addr = "talaia.watch";
+        let receipt = get_random_registration_receipt();
+
+        // Check the receipt was stored
+        dbm.store_tower_record(tower_id, net_addr, &receipt)
+            .unwrap();
+        assert_eq!(
+            dbm.load_registration_receipt(tower_id, receipt.user_id())
+                .unwrap(),
+            receipt
+        );
+
+        // Add another receipt for the same tower with a higher expiry and check this last one is loaded
+        let latest_receipt =
+            get_random_registration_receipt_with_expiry(receipt.subscription_expiry() + 100);
+
+        dbm.store_tower_record(tower_id, net_addr, &latest_receipt)
+            .unwrap();
+        assert_eq!(
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
+                .unwrap(),
+            latest_receipt
+        );
+
+        // Add a final one with a lower expiry and check the last is still loaded
+        let middle_receipt =
+            get_random_registration_receipt_with_expiry(receipt.subscription_expiry() + 50);
+
+        dbm.store_tower_record(tower_id, net_addr, &middle_receipt)
+            .unwrap();
+        assert_eq!(
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
+                .unwrap(),
+            latest_receipt
+        );
+
+        // FIXME: Check storing the same receipt twice
     }
 
     #[test]
@@ -603,7 +695,7 @@ mod tests {
 
     #[test]
     fn test_store_load_towers() {
-        let dbm = DBM::in_memory().unwrap();
+        let mut dbm = DBM::in_memory().unwrap();
         let mut towers = HashMap::new();
 
         // In order to add a tower record we need to associated registration receipt.
@@ -617,6 +709,7 @@ mod tests {
                 TowerSummary::new(
                     net_addr.into(),
                     receipt.available_slots(),
+                    receipt.subscription_start(),
                     receipt.subscription_expiry(),
                 ),
             );
@@ -647,6 +740,7 @@ mod tests {
         let mut tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
@@ -694,6 +788,7 @@ mod tests {
         let tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
@@ -760,6 +855,7 @@ mod tests {
         let mut tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         )
         .with_status(TowerStatus::TemporaryUnreachable);
@@ -889,6 +985,7 @@ mod tests {
         let mut tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
@@ -951,6 +1048,7 @@ mod tests {
         let tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
@@ -999,6 +1097,7 @@ mod tests {
         let tower_summary = TowerSummary::new(
             net_addr.into(),
             receipt.available_slots(),
+            receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
