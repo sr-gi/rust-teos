@@ -109,16 +109,24 @@ async fn register(
         ));
     }
 
-    log::info!(
-        "Registration succeeded. Available slots: {}",
-        receipt.available_slots()
-    );
-
     plugin
         .state()
         .lock()
         .unwrap()
-        .add_update_tower(tower_id, tower_net_addr, &receipt);
+        .add_update_tower(tower_id, tower_net_addr, &receipt).map_err(|e| {
+            if e.is_expiry() {
+                anyhow!("Registration receipt contains a subscription expiry that is not higher than the one we are currently registered for")
+            } else {
+                anyhow!("Registration receipt does not contain more slots than the ones we are currently registered for")
+            }
+        })?;
+
+    log::info!(
+        "Registration succeeded. Available slots: {}. Subscription period: {}-{}",
+        receipt.available_slots(),
+        receipt.subscription_start(),
+        receipt.subscription_expiry()
+    );
 
     Ok(json!(receipt))
 }

@@ -13,7 +13,7 @@ use teos_common::receipts::{AppointmentReceipt, RegistrationReceipt};
 use teos_common::{TowerId, UserId};
 
 use crate::dbm::DBM;
-use crate::{MisbehaviorProof, TowerInfo, TowerStatus, TowerSummary};
+use crate::{MisbehaviorProof, SubscriptionError, TowerInfo, TowerStatus, TowerSummary};
 
 /// Represents the watchtower client that is being used as the CoreLN plugin state.
 #[derive(Clone)]
@@ -79,7 +79,25 @@ impl WTClient {
         tower_id: TowerId,
         tower_net_addr: String,
         receipt: &RegistrationReceipt,
-    ) {
+    ) -> Result<(), SubscriptionError> {
+        if let Some(tower) = self.towers.get(&tower_id) {
+            // TODO: For now we're forcing updates to increase both slots and expiry. This is not mandatory and may
+            // be changed in the future, but the tower is currently set to do this anyway so let's keep it simple.
+            if receipt.subscription_expiry() <= tower.subscription_expiry {
+                return Err(SubscriptionError::Expiry);
+            } else {
+                let previous_receipt = self
+                    .dbm
+                    .lock()
+                    .unwrap()
+                    .load_registration_receipt(tower_id, self.user_id)
+                    .unwrap();
+                if receipt.available_slots() <= previous_receipt.available_slots() {
+                    return Err(SubscriptionError::Slots);
+                }
+            }
+        }
+
         self.dbm
             .lock()
             .unwrap()
@@ -94,6 +112,8 @@ impl WTClient {
                 receipt.subscription_expiry(),
             ),
         );
+
+        Ok(())
     }
 
     /// Loads a tower record from the database.
@@ -217,8 +237,8 @@ mod tests {
 
     use teos_common::test_utils::{
         generate_random_appointment, get_random_appointment_receipt,
-        get_random_registration_receipt, get_random_registration_receipt_with_expiry,
-        get_random_user_id,
+        get_random_registration_receipt, get_random_user_id,
+        get_registration_receipt_from_previous,
     };
 
     #[tokio::test]
@@ -237,7 +257,9 @@ mod tests {
             receipt.subscription_expiry(),
         );
 
-        wt_client.add_update_tower(tower_id, tower_info.net_addr.clone(), &receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_info.net_addr.clone(), &receipt)
+            .unwrap();
         assert_eq!(
             wt_client.towers.get(&tower_id),
             Some(&TowerSummary::from(tower_info.clone()))
@@ -245,7 +267,7 @@ mod tests {
         assert_eq!(wt_client.load_tower_info(tower_id).unwrap(), tower_info);
 
         // Calling the method again with updated information should also updated the records in memory and the database
-        receipt = get_random_registration_receipt_with_expiry(receipt.subscription_expiry() + 100);
+        receipt = get_registration_receipt_from_previous(&receipt);
 
         let updated_tower_info = TowerInfo::empty(
             "talaia.watch".into(),
@@ -253,7 +275,9 @@ mod tests {
             receipt.subscription_start(),
             receipt.subscription_expiry(),
         );
-        wt_client.add_update_tower(tower_id, updated_tower_info.net_addr.clone(), &receipt);
+        wt_client
+            .add_update_tower(tower_id, updated_tower_info.net_addr.clone(), &receipt)
+            .unwrap();
 
         assert_eq!(
             wt_client.towers.get(&tower_id),
@@ -263,6 +287,41 @@ mod tests {
             wt_client.load_tower_info(tower_id).unwrap(),
             updated_tower_info
         );
+
+        // If we try to update without increasing both the end_time and the slots, this will fail
+        let receipt_same_slots = RegistrationReceipt::new(
+            receipt.user_id(),
+            receipt.available_slots(),
+            receipt.subscription_start(),
+            receipt.subscription_expiry() + 1,
+        );
+        let receipt_same_expiry = RegistrationReceipt::new(
+            receipt.user_id(),
+            receipt.available_slots() + 1,
+            receipt.subscription_start(),
+            receipt.subscription_expiry(),
+        );
+
+        assert!(matches!(
+            wt_client.add_update_tower(tower_id, updated_tower_info.net_addr.clone(), &receipt),
+            Err(SubscriptionError::Expiry)
+        ));
+        assert!(matches!(
+            wt_client.add_update_tower(
+                tower_id,
+                updated_tower_info.net_addr.clone(),
+                &receipt_same_slots
+            ),
+            Err(SubscriptionError::Slots)
+        ));
+        assert!(matches!(
+            wt_client.add_update_tower(
+                tower_id,
+                updated_tower_info.net_addr.clone(),
+                &receipt_same_expiry
+            ),
+            Err(SubscriptionError::Expiry)
+        ));
     }
 
     #[tokio::test]
@@ -279,7 +338,9 @@ mod tests {
         // If the tower is known, the status will be updated.
         let receipt = get_random_registration_receipt();
         let tower_id = get_random_user_id();
-        wt_client.add_update_tower(tower_id, "talaia.watch".into(), &receipt);
+        wt_client
+            .add_update_tower(tower_id, "talaia.watch".into(), &receipt)
+            .unwrap();
 
         for status in [
             TowerStatus::Reachable,
@@ -326,7 +387,9 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.add_appointment_receipt(
             tower_id,
             locator,
@@ -369,7 +432,9 @@ mod tests {
             Vec::new(),
         );
 
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.add_pending_appointment(tower_id, &appointment);
 
         assert!(wt_client.towers.contains_key(&tower_id));
@@ -400,7 +465,9 @@ mod tests {
         wt_client.remove_pending_appointment(tower_id, appointment.locator);
 
         // Add the tower to the state and try again
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.add_pending_appointment(tower_id, &appointment);
 
         wt_client.remove_pending_appointment(tower_id, appointment.locator);
@@ -447,7 +514,9 @@ mod tests {
             vec![appointment.clone()],
         );
 
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.add_invalid_appointment(tower_id, &appointment);
 
         assert!(wt_client.towers.contains_key(&tower_id));
@@ -470,7 +539,9 @@ mod tests {
         let registration_receipt = get_random_registration_receipt();
         let appointment = generate_random_appointment(None);
 
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.add_pending_appointment(tower_id, &appointment);
 
         // Check that the appointment can be moved from pending to invalid
@@ -524,12 +595,16 @@ mod tests {
         let registration_receipt = get_random_registration_receipt();
         let appointment = generate_random_appointment(None);
 
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
-        wt_client.add_update_tower(
-            another_tower_id,
-            tower_net_addr.into(),
-            &registration_receipt,
-        );
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
+        wt_client
+            .add_update_tower(
+                another_tower_id,
+                tower_net_addr.into(),
+                &registration_receipt,
+            )
+            .unwrap();
         wt_client.add_pending_appointment(tower_id, &appointment);
         wt_client.add_pending_appointment(another_tower_id, &appointment);
 
@@ -618,7 +693,9 @@ mod tests {
 
         // // Add the tower to the state and try again
         let registration_receipt = get_random_registration_receipt();
-        wt_client.add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt);
+        wt_client
+            .add_update_tower(tower_id, tower_net_addr.into(), &registration_receipt)
+            .unwrap();
         wt_client.flag_misbehaving_tower(tower_id, proof.clone());
 
         // Check data in memory

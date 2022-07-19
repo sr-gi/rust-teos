@@ -35,6 +35,19 @@ pub enum AppointmentStatus {
     Invalid,
 }
 
+/// Errors related to updating a subscription
+#[derive(Debug, PartialEq, Eq)]
+pub enum SubscriptionError {
+    Expiry,
+    Slots,
+}
+
+impl SubscriptionError {
+    pub fn is_expiry(&self) -> bool {
+        *self == SubscriptionError::Expiry
+    }
+}
+
 impl fmt::Display for TowerStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

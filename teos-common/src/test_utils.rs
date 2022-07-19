@@ -62,10 +62,14 @@ pub fn get_random_registration_receipt() -> RegistrationReceipt {
     receipt
 }
 
-pub fn get_random_registration_receipt_with_expiry(expiry: u32) -> RegistrationReceipt {
+pub fn get_registration_receipt_from_previous(r: &RegistrationReceipt) -> RegistrationReceipt {
     let (sk, _) = cryptography::get_random_keypair();
-    let mut receipt =
-        RegistrationReceipt::new(get_random_user_id(), get_random_int(), expiry - 420, expiry);
+    let mut receipt = RegistrationReceipt::new(
+        r.user_id(),
+        r.available_slots() + 1 + get_random_int::<u8>() as u32,
+        r.subscription_start(),
+        r.subscription_expiry() + 1 + get_random_int::<u8>() as u32,
+    );
     receipt.sign(&sk);
 
     receipt
