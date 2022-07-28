@@ -4,7 +4,6 @@
 use std::collections::{HashMap, HashSet};
 use std::iter::FromIterator;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use rusqlite::limits::Limit;
 use rusqlite::{params, params_from_iter, Connection, Error as SqliteError};
@@ -542,7 +541,7 @@ impl DBM {
     /// When a new key is generated, old keys are not overwritten but are not retrievable from the API either.
     pub fn store_tower_key(&self, sk: &SecretKey) -> Result<(), Error> {
         let query = "INSERT INTO keys (key) VALUES (?)";
-        self.store_data(query, params![sk.to_string()])
+        self.store_data(query, params![sk.secret_bytes().to_vec()])
     }
 
     /// Loads the last known tower secret key from the database.
@@ -558,8 +557,8 @@ impl DBM {
             .unwrap();
 
         stmt.query_row(["keys"], |row| {
-            let sk: String = row.get(0).unwrap();
-            Ok(SecretKey::from_str(&sk).unwrap())
+            let sk: Vec<u8> = row.get(0).unwrap();
+            Ok(SecretKey::from_slice(&sk).unwrap())
         })
         .map_err(|_| Error::NotFound)
     }

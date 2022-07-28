@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use bitcoin::consensus;
 use bitcoin::{BlockHeader, Transaction, Txid};
-use lightning::chain;
+use lightning::chain::{self, transaction::TransactionData};
 
 use teos_common::constants;
 use teos_common::protos as common_msgs;
@@ -492,17 +492,21 @@ impl chain::Listen for Responder {
     /// Every time a block is received the tracking conditions are checked against the monitored [TransactionTracker]s and
     /// data deletion is performed accordingly. Moreover, lack of confirmations is check for the tracked transactions and
     /// rebroadcasting is performed for those that have missed too many.
-    fn block_connected(&self, block: &bitcoin::Block, height: u32) {
-        log::info!("New block received: {}", block.header.block_hash());
+    fn filtered_block_connected(
+        &self,
+        header: &BlockHeader,
+        txdata: &TransactionData,
+        height: u32,
+    ) {
+        log::info!("New block received: {}", header.block_hash());
         self.carrier.lock().unwrap().update_height(height);
 
         if self.trackers.lock().unwrap().len() > 0 {
             // Complete those appointments that are due at this height
             let completed_trackers = self.check_confirmations(
-                &block
-                    .txdata
+                &txdata
                     .iter()
-                    .map(|tx| tx.txid())
+                    .map(|(_, tx)| tx.txid())
                     .collect::<Vec<Txid>>(),
                 height,
             );

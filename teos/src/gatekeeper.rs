@@ -5,7 +5,8 @@ use std::iter::FromIterator;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use lightning::chain;
+use bitcoin::BlockHeader;
+use lightning::chain::{self, transaction::TransactionData};
 
 use teos_common::appointment::compute_appointment_slots;
 use teos_common::constants::ENCRYPTED_BLOB_MAX_SIZE;
@@ -312,8 +313,8 @@ impl chain::Listen for Gatekeeper {
     /// Handles the monitoring process by the [Gatekeeper].
     ///
     /// This is mainly used to keep track of time and expire / outdate subscriptions when needed.
-    fn block_connected(&self, block: &bitcoin::Block, height: u32) {
-        log::info!("New block received: {}", block.block_hash());
+    fn filtered_block_connected(&self, header: &BlockHeader, _: &TransactionData, height: u32) {
+        log::info!("New block received: {}", header.block_hash());
 
         // Expired user deletion is delayed. Users are deleted when their subscription is outdated, not expired.
         let outdated_users = self.get_outdated_user_ids(height);
