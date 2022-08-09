@@ -111,8 +111,7 @@ def test_unreachable_watchtower(node_factory, bitcoind, teosd):
         time.sleep(1)
 
     assert l2.rpc.gettowerinfo(tower_id)["status"] == "reachable"
-    assert not l2.rpc.gettowerinfo(tower_id)["pending_appointments"]
-
+    
 
 def test_retry_watchtower(node_factory, bitcoind, teosd):
     # The plugin is set to give up on retrying straight-away so we can test this fast.
@@ -135,9 +134,9 @@ def test_retry_watchtower(node_factory, bitcoind, teosd):
     # Start the tower and retry it
     teosd.start()
     l2.rpc.retrytower(tower_id)
-    time.sleep(2)
+    while l2.rpc.gettowerinfo(tower_id)["status"] != "reachable":
+        time.sleep(1)
 
-    assert l2.rpc.gettowerinfo(tower_id)["status"] == "reachable"
     assert not l2.rpc.gettowerinfo(tower_id)["pending_appointments"]
 
 
