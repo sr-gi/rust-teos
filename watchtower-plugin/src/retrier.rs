@@ -190,7 +190,7 @@ mod tests {
 
     use httpmock::prelude::*;
     use serde_json::json;
-    use tokio::fs;
+    use tempdir::TempDir;
     use tokio::sync::mpsc::unbounded_channel;
 
     use teos_common::errors;
@@ -216,9 +216,11 @@ mod tests {
     // TODO: It'll be nice to toggle the mock on and off instead of having it always on. Not sure MockServer allows that though:
     // https://github.com/alexliesenfeld/httpmock/issues/67
     async fn test_manage_retry_reachable() {
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+        ));
         let server = MockServer::start();
 
         // Add a tower with pending appointments
@@ -286,14 +288,15 @@ mod tests {
         api_mock.assert();
 
         task.abort();
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_manage_retry_unreachable() {
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+        ));
 
         // Add a tower with pending appointments
         let (_, tower_pk) = cryptography::get_random_keypair();
@@ -350,14 +353,15 @@ mod tests {
         );
 
         task.abort();
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_manage_retry_rejected() {
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+        ));
         let server = MockServer::start();
 
         // Add a tower with pending appointments
@@ -428,14 +432,15 @@ mod tests {
         api_mock.assert();
 
         task.abort();
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_manage_retry_misbehaving() {
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+        ));
         let server = MockServer::start();
 
         // Add a tower with pending appointments
@@ -493,14 +498,15 @@ mod tests {
         api_mock.assert();
 
         task.abort();
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_manage_retry_abandoned() {
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let (tx, rx) = unbounded_channel();
-        let wt_client = Arc::new(Mutex::new(WTClient::new(tmp_path.into(), tx.clone()).await));
+        let wt_client = Arc::new(Mutex::new(
+            WTClient::new(tmp_path.path().to_path_buf(), tx.clone()).await,
+        ));
         let server = MockServer::start();
 
         // Add a tower with pending appointments
@@ -536,16 +542,15 @@ mod tests {
         assert!(!wt_client.lock().unwrap().towers.contains_key(&tower_id));
 
         task.abort();
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment() {
         let (tower_sk, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -582,17 +587,15 @@ mod tests {
         let r = Retrier::dummy(wt_client).add_appointment(tower_id).await;
         assert_eq!(r, Ok(()));
         api_mock.assert();
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_no_pending() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -608,17 +611,15 @@ mod tests {
         let r = Retrier::dummy(wt_client).add_appointment(tower_id).await;
 
         assert_eq!(r, Ok(()));
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_misbehaving() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -654,17 +655,15 @@ mod tests {
         let r = Retrier::dummy(wt_client).add_appointment(tower_id).await;
         assert_eq!(r, Err(Error::permanent("Tower misbehaved")));
         api_mock.assert();
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_unreachable() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
 
         // The tower we'd like to retry sending appointments to has to exist within the plugin
@@ -683,17 +682,15 @@ mod tests {
             .add_pending_appointment(tower_id, &appointment);
         let r = Retrier::dummy(wt_client).add_appointment(tower_id).await;
         assert_eq!(r, Err(Error::transient("Tower cannot be reached")));
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_subscription_error() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -725,17 +722,15 @@ mod tests {
 
         assert_eq!(r, Err(Error::transient("Subscription error")));
         api_mock.assert();
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_rejected() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -777,17 +772,15 @@ mod tests {
             .unwrap()
             .invalid_appointments
             .contains(&appointment.locator));
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_add_appointment_abandoned() {
         let (_, tower_pk) = cryptography::get_random_keypair();
         let tower_id = TowerId(tower_pk);
-        let tmp_path = &format!(".watchtower_{}/", get_random_user_id());
+        let tmp_path = TempDir::new(&format!("watchtower_{}", get_random_user_id())).unwrap();
         let wt_client = Arc::new(Mutex::new(
-            WTClient::new(tmp_path.into(), unbounded_channel().0).await,
+            WTClient::new(tmp_path.path().to_path_buf(), unbounded_channel().0).await,
         ));
         let server = MockServer::start();
 
@@ -815,7 +808,5 @@ mod tests {
             r,
             Err(Error::permanent("Tower was flagged to be abandoned"))
         );
-
-        fs::remove_dir_all(tmp_path).await.unwrap();
     }
 }
