@@ -111,7 +111,7 @@ def test_unreachable_watchtower(node_factory, bitcoind, teosd):
         time.sleep(1)
 
     assert l2.rpc.gettowerinfo(tower_id)["status"] == "reachable"
-    
+
 
 def test_retry_watchtower(node_factory, bitcoind, teosd):
     # The plugin is set to give up on retrying straight-away so we can test this fast.

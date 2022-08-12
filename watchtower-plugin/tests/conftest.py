@@ -123,3 +123,9 @@ def pytest_runtest_setup(item):
                 pytest.skip("!DEVELOPER: {}".format(mark.args[0]))
             else:
                 pytest.skip("!DEVELOPER: Requires DEVELOPER=1")
+
+
+@pytest.fixture(scope='function', autouse=True)
+def log_name(request):
+    # Here logging is used, you can use whatever you want to use for logs
+    logging.info("Starting '{}'".format(request.node.name))

@@ -437,18 +437,25 @@ async fn on_commitment_revocation(
         } else {
             if status.is_subscription_error() {
                 log::warn!(
-                    "There is a subscription issue with {}. Adding appointment to pending",
+                    "There is a subscription issue with {}. Adding {} to pending",
                     tower_id,
+                    appointment.locator
                 );
             } else {
-                log::warn!("{} is {}. Adding appointment to pending", tower_id, status);
+                log::warn!(
+                    "{} is {}. Adding {} to pending",
+                    tower_id,
+                    status,
+                    appointment.locator,
+                );
             }
 
-            plugin
-                .state()
-                .lock()
-                .unwrap()
-                .add_pending_appointment(tower_id, &appointment);
+            let mut state = plugin.state().lock().unwrap();
+            state.add_pending_appointment(tower_id, &appointment);
+            state
+                .unreachable_towers
+                .send((tower_id, appointment.locator))
+                .unwrap();
         }
     }
 

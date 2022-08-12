@@ -69,7 +69,7 @@ impl Retrier {
             }
 
             log::info!("Retrying tower {}", tower_id);
-            match retry_notify(
+            let r = retry_notify(
                 ExponentialBackoff {
                     max_elapsed_time: Some(Duration::from_secs(self.max_elapsed_time_secs as u64)),
                     max_interval: Duration::from_secs(self.max_interval_time_secs as u64),
@@ -80,27 +80,26 @@ impl Retrier {
                     log::warn!("Retry error happened with {}. {}", tower_id, err);
                 },
             )
-            .await
-            {
+            .await;
+
+            self.pending_appointments.lock().unwrap().remove(&tower_id);
+            let mut state = self.wt_client.lock().unwrap();
+            match r {
                 Ok(_) => {
                     log::info!("Retry strategy succeeded for {}", tower_id);
-                    self.wt_client
-                        .lock()
-                        .unwrap()
-                        .set_tower_status(tower_id, crate::TowerStatus::Reachable);
+                    state.set_tower_status(tower_id, crate::TowerStatus::Reachable);
                 }
                 Err(e) => {
                     log::warn!("Retry strategy gave up for {}. {}", tower_id, e);
                     // Notice we'll end up here after a permanent error. That is, either after finishing the backoff strategy
                     // unsuccessfully or by manually raising such an error (like when facing a tower misbehavior)
-                    let mut wt_client = self.wt_client.lock().unwrap();
-                    let status = wt_client.towers.get(&tower_id).unwrap().status;
+                    let status = state.towers.get(&tower_id).unwrap().status;
                     if status.is_unreachable() {
                         log::warn!("Setting {} as unreachable", tower_id);
-                        wt_client.set_tower_status(tower_id, crate::TowerStatus::Unreachable);
+                        state.set_tower_status(tower_id, crate::TowerStatus::Unreachable);
                     } else if status.is_abandoned() {
                         log::info!("Abandoning {}", tower_id);
-                        wt_client.remove_tower(tower_id).unwrap();
+                        state.remove_tower(tower_id).unwrap();
                     }
                 }
             }
@@ -113,12 +112,22 @@ impl Retrier {
     fn add_pending_appointment(&self, tower_id: TowerId, locator: Locator) {
         let mut pending_appointments = self.pending_appointments.lock().unwrap();
         if let std::collections::hash_map::Entry::Vacant(e) = pending_appointments.entry(tower_id) {
+            log::debug!(
+                "Creating a new entry for tower {} with locator {}",
+                tower_id,
+                locator
+            );
             self.wt_client
                 .lock()
                 .unwrap()
                 .set_tower_status(tower_id, crate::TowerStatus::TemporaryUnreachable);
             e.insert(HashSet::from([locator]));
         } else {
+            log::debug!(
+                "Adding pending appointment {} to existing tower {}",
+                locator,
+                tower_id
+            );
             pending_appointments
                 .get_mut(&tower_id)
                 .unwrap()
@@ -253,7 +262,6 @@ impl Retrier {
             }
         }
 
-        self.pending_appointments.lock().unwrap().remove(&tower_id);
         Ok(())
     }
 }
