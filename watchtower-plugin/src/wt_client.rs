@@ -23,7 +23,7 @@ pub struct WTClient {
     /// A collection of towers the client is registered to.
     pub towers: HashMap<TowerId, TowerSummary>,
     /// Queue of unreachable towers
-    pub unreachable_towers: UnboundedSender<TowerId>,
+    pub unreachable_towers: UnboundedSender<(TowerId, Locator)>,
     /// The user secret key.
     pub user_sk: SecretKey,
     /// The user identifier.
@@ -33,7 +33,10 @@ pub struct WTClient {
 }
 
 impl WTClient {
-    pub async fn new(data_dir: PathBuf, unreachable_towers: UnboundedSender<TowerId>) -> Self {
+    pub async fn new(
+        data_dir: PathBuf,
+        unreachable_towers: UnboundedSender<(TowerId, Locator)>,
+    ) -> Self {
         // Create data dir if it does not exist
         fs::create_dir_all(&data_dir).await.unwrap_or_else(|e| {
             log::error!("Cannot create data dir: {:?}", e);
@@ -57,7 +60,9 @@ impl WTClient {
         let towers = dbm.load_towers();
         for (tower_id, tower) in towers.iter() {
             if tower.status.is_unreachable() {
-                unreachable_towers.send(*tower_id).unwrap();
+                for locator in tower.pending_appointments.iter() {
+                    unreachable_towers.send((*tower_id, *locator)).unwrap();
+                }
             }
         }
 

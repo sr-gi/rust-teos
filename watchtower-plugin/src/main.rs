@@ -326,10 +326,18 @@ async fn retry_tower(
             ));
         }
 
-        state
-            .unreachable_towers
-            .send(tower_id)
-            .map_err(|e| anyhow!(e))?;
+        for locator in state
+            .towers
+            .get(&tower_id)
+            .unwrap()
+            .pending_appointments
+            .iter()
+        {
+            state
+                .unreachable_towers
+                .send((tower_id, *locator))
+                .map_err(|e| anyhow!(e))?;
+        }
         Ok(json!(format!("Retrying {}", tower_id)))
     } else {
         Err(anyhow!("Unknown tower {}", tower_id))
@@ -421,17 +429,27 @@ async fn on_commitment_revocation(
                             state.set_tower_status(tower_id, TowerStatus::TemporaryUnreachable);
                             state.add_pending_appointment(tower_id, &appointment);
 
-                            state.unreachable_towers.send(tower_id).unwrap();
+                            state
+                                .unreachable_towers
+                                .send((tower_id, appointment.locator))
+                                .unwrap();
                         }
                     }
                     AddAppointmentError::ApiError(e) => match e.error_code {
                         errors::INVALID_SIGNATURE_OR_SUBSCRIPTION_ERROR => {
-                            log::warn!("There is a subscription issue with {}", tower_id);
+                            log::warn!(
+                                "There is a subscription issue with {}. Adding {} to pending",
+                                tower_id,
+                                appointment.locator
+                            );
                             let mut state = plugin.state().lock().unwrap();
                             state.set_tower_status(tower_id, TowerStatus::SubscriptionError);
                             state.add_pending_appointment(tower_id, &appointment);
 
-                            state.unreachable_towers.send(tower_id).unwrap();
+                            state
+                                .unreachable_towers
+                                .send((tower_id, appointment.locator))
+                                .unwrap();
                         }
 
                         _ => {
@@ -466,18 +484,25 @@ async fn on_commitment_revocation(
         } else {
             if status.is_subscription_error() {
                 log::warn!(
-                    "There is a subscription issue with {}. Adding appointment to pending",
+                    "There is a subscription issue with {}. Adding {} to pending",
                     tower_id,
+                    appointment.locator
                 );
             } else {
-                log::warn!("{} is {}. Adding appointment to pending", tower_id, status);
+                log::warn!(
+                    "{} is {}. Adding {} to pending",
+                    tower_id,
+                    status,
+                    appointment.locator,
+                );
             }
 
-            plugin
-                .state()
-                .lock()
-                .unwrap()
-                .add_pending_appointment(tower_id, &appointment);
+            let mut state = plugin.state().lock().unwrap();
+            state.add_pending_appointment(tower_id, &appointment);
+            state
+                .unreachable_towers
+                .send((tower_id, appointment.locator))
+                .unwrap();
         }
     }
 
