@@ -134,7 +134,7 @@ def test_retry_watchtower(node_factory, bitcoind, teosd):
     # Start the tower and retry it
     teosd.start()
     l2.rpc.retrytower(tower_id)
-    while l2.rpc.gettowerinfo(tower_id)["status"] != "reachable":
+    while l2.rpc.gettowerinfo(tower_id)["pending_appointments"]:
         time.sleep(1)
 
     assert l2.rpc.gettowerinfo(tower_id)["status"] == "reachable"
