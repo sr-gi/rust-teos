@@ -14,28 +14,22 @@ use teos_common::UserId as TowerId;
 use crate::net::http::{add_appointment, AddAppointmentError};
 use crate::wt_client::WTClient;
 
-pub struct Retrier {
+pub struct RetryManager {
     wt_client: Arc<Mutex<WTClient>>,
-    max_elapsed_time_secs: u16,
-    max_interval_time_secs: u16,
-    pending_appointments: Arc<Mutex<HashMap<TowerId, HashSet<Locator>>>>,
+    retriers: Arc<Mutex<HashMap<TowerId, Retrier>>>,
 }
 
-impl Retrier {
-    pub fn new(
-        wt_client: Arc<Mutex<WTClient>>,
-        max_elapsed_time_secs: u16,
-        max_interval_time_secs: u16,
-    ) -> Self {
-        Self {
+impl RetryManager {
+    pub fn new(wt_client: Arc<Mutex<WTClient>>) -> Self {
+        RetryManager {
             wt_client,
-            max_elapsed_time_secs,
-            max_interval_time_secs,
-            pending_appointments: Arc::new(Mutex::new(HashMap::new())),
+            retriers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     pub async fn manage_retry(
-        &self,
+        &mut self,
+        max_elapsed_time_secs: u16,
+        max_interval_time_secs: u16,
         mut unreachable_towers: UnboundedReceiver<(TowerId, Locator)>,
     ) {
         log::info!("Starting retry manager");
@@ -51,45 +45,53 @@ impl Retrier {
                 }
             }
 
-            if self.add_pending_appointment(tower_id, locator) {
+            if let Some(retrier) = self.add_pending_appointment(tower_id, locator) {
                 log::info!("Retrying tower {}", tower_id);
-                let r = retry_notify(
-                    ExponentialBackoff {
-                        max_elapsed_time: Some(Duration::from_secs(
-                            self.max_elapsed_time_secs as u64,
-                        )),
-                        max_interval: Duration::from_secs(self.max_interval_time_secs as u64),
-                        ..ExponentialBackoff::default()
-                    },
-                    || async { self.retry_tower(tower_id).await },
-                    |err, _| {
-                        log::warn!("Retry error happened with {}. {}", tower_id, err);
-                    },
-                )
-                .await;
+                let wt_client = self.wt_client.clone();
+                let retriers = self.retriers.clone();
 
-                let mut state = self.wt_client.lock().unwrap();
-                self.pending_appointments.lock().unwrap().remove(&tower_id);
+                tokio::spawn(async move {
+                    let r = retry_notify(
+                        ExponentialBackoff {
+                            max_elapsed_time: Some(Duration::from_secs(
+                                max_elapsed_time_secs as u64,
+                            )),
+                            max_interval: Duration::from_secs(max_interval_time_secs as u64),
+                            ..ExponentialBackoff::default()
+                        },
+                        || async { retrier.retry_tower(tower_id).await },
+                        |err, _| {
+                            log::warn!("Retry error happened with {}. {}", tower_id, err);
+                        },
+                    )
+                    .await;
 
-                match r {
-                    Ok(_) => {
-                        log::info!("Retry strategy succeeded for {}", tower_id);
-                        state.set_tower_status(tower_id, crate::TowerStatus::Reachable);
-                    }
-                    Err(e) => {
-                        log::warn!("Retry strategy gave up for {}. {}", tower_id, e);
-                        // Notice we'll end up here after a permanent error. That is, either after finishing the backoff strategy
-                        // unsuccessfully or by manually raising such an error (like when facing a tower misbehavior)
-                        if let Some(tower) = state.towers.get_mut(&tower_id) {
-                            if tower.status.is_unreachable() {
-                                log::warn!("Setting {} as unreachable", tower_id);
-                                state.set_tower_status(tower_id, crate::TowerStatus::Unreachable);
+                    let mut state = wt_client.lock().unwrap();
+                    retriers.lock().unwrap().remove(&tower_id);
+
+                    match r {
+                        Ok(_) => {
+                            log::info!("Retry strategy succeeded for {}", tower_id);
+                            state.set_tower_status(tower_id, crate::TowerStatus::Reachable);
+                        }
+                        Err(e) => {
+                            log::warn!("Retry strategy gave up for {}. {}", tower_id, e);
+                            // Notice we'll end up here after a permanent error. That is, either after finishing the backoff strategy
+                            // unsuccessfully or by manually raising such an error (like when facing a tower misbehavior)
+                            if let Some(tower) = state.towers.get_mut(&tower_id) {
+                                if tower.status.is_unreachable() {
+                                    log::warn!("Setting {} as unreachable", tower_id);
+                                    state.set_tower_status(
+                                        tower_id,
+                                        crate::TowerStatus::Unreachable,
+                                    );
+                                }
+                            } else {
+                                log::info!("Skipping retrying abandoned tower {}", tower_id);
                             }
-                        } else {
-                            log::info!("Skipping retrying abandoned tower {}", tower_id);
                         }
                     }
-                }
+                });
             }
         }
     }
@@ -99,9 +101,9 @@ impl Retrier {
     /// If the tower is not currently being retried, a new entry for it is created, otherwise, the data is appended to the existing entry.
     ///
     /// Returns true if a new entry is created, false otherwise.
-    fn add_pending_appointment(&self, tower_id: TowerId, locator: Locator) -> bool {
-        let mut pending_appointments = self.pending_appointments.lock().unwrap();
-        if let std::collections::hash_map::Entry::Vacant(e) = pending_appointments.entry(tower_id) {
+    fn add_pending_appointment(&mut self, tower_id: TowerId, locator: Locator) -> Option<Retrier> {
+        let mut retriers = self.retriers.lock().unwrap();
+        if let std::collections::hash_map::Entry::Vacant(e) = retriers.entry(tower_id) {
             log::debug!(
                 "Creating a new entry for tower {} with locator {}",
                 tower_id,
@@ -111,21 +113,41 @@ impl Retrier {
                 .lock()
                 .unwrap()
                 .set_tower_status(tower_id, crate::TowerStatus::TemporaryUnreachable);
-            e.insert(HashSet::from([locator]));
 
-            true
+            let retrier = Retrier::new(self.wt_client.clone(), locator);
+            e.insert(retrier.clone());
+
+            Some(retrier)
         } else {
             log::debug!(
                 "Adding pending appointment {} to existing tower {}",
                 locator,
                 tower_id
             );
-            pending_appointments
-                .get_mut(&tower_id)
+            retriers
+                .get(&tower_id)
+                .unwrap()
+                .pending_appointments
+                .lock()
                 .unwrap()
                 .insert(locator);
 
-            false
+            None
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Retrier {
+    wt_client: Arc<Mutex<WTClient>>,
+    pending_appointments: Arc<Mutex<HashSet<Locator>>>,
+}
+
+impl Retrier {
+    pub fn new(wt_client: Arc<Mutex<WTClient>>, locator: Locator) -> Self {
+        Self {
+            wt_client,
+            pending_appointments: Arc::new(Mutex::new(HashSet::from([locator]))),
         }
     }
 
@@ -137,12 +159,7 @@ impl Retrier {
                 return Err(Error::permanent("Tower was abandoned. Skipping retry"));
             }
 
-            if !self
-                .pending_appointments
-                .lock()
-                .unwrap()
-                .contains_key(&tower_id)
-            {
+            if self.pending_appointments.lock().unwrap().is_empty() {
                 return Err(Error::permanent("Tower has no data pending for retry"));
             }
 
@@ -151,21 +168,8 @@ impl Retrier {
             (net_addr, user_sk, wt_client.proxy.clone())
         };
 
-        while !self
-            .pending_appointments
-            .lock()
-            .unwrap()
-            .get(&tower_id)
-            .unwrap()
-            .is_empty()
-        {
-            let locators = self
-                .pending_appointments
-                .lock()
-                .unwrap()
-                .get(&tower_id)
-                .unwrap()
-                .clone();
+        while !self.pending_appointments.lock().unwrap().is_empty() {
+            let locators = self.pending_appointments.lock().unwrap().clone();
             for locator in locators.into_iter() {
                 let appointment = self
                     .wt_client
@@ -187,12 +191,7 @@ impl Retrier {
                 .await
                 {
                     Ok((slots, receipt)) => {
-                        self.pending_appointments
-                            .lock()
-                            .unwrap()
-                            .get_mut(&tower_id)
-                            .unwrap()
-                            .remove(&locator);
+                        self.pending_appointments.lock().unwrap().remove(&locator);
                         let mut wt_client = self.wt_client.lock().unwrap();
                         wt_client.add_appointment_receipt(
                             tower_id,
@@ -228,12 +227,7 @@ impl Retrier {
                                     );
                                     // We need to move the appointment from pending to invalid
                                     // Add it first to invalid and remove it from pending later so a cascade delete is not triggered
-                                    self.pending_appointments
-                                        .lock()
-                                        .unwrap()
-                                        .get_mut(&tower_id)
-                                        .unwrap()
-                                        .remove(&locator);
+                                    self.pending_appointments.lock().unwrap().remove(&locator);
                                     let mut wt_client = self.wt_client.lock().unwrap();
                                     wt_client.add_invalid_appointment(tower_id, &appointment);
                                     wt_client
@@ -281,8 +275,11 @@ mod tests {
     const MAX_INTERVAL_TIME: u16 = 1;
 
     impl Retrier {
-        fn dummy(wt_client: Arc<Mutex<WTClient>>) -> Self {
-            Self::new(wt_client, 0, 0)
+        fn empty(wt_client: Arc<Mutex<WTClient>>) -> Self {
+            Self {
+                wt_client,
+                pending_appointments: Arc::new(Mutex::new(HashSet::new())),
+            }
         }
     }
 
@@ -332,8 +329,8 @@ mod tests {
         // Start the task and send the tower to the channel for retry
         let wt_client_clone = wt_client.clone();
         let task = tokio::spawn(async move {
-            Retrier::new(wt_client_clone, MAX_ELAPSED_TIME, MAX_INTERVAL_TIME)
-                .manage_retry(rx)
+            RetryManager::new(wt_client_clone)
+                .manage_retry(MAX_ELAPSED_TIME, MAX_INTERVAL_TIME, rx)
                 .await
         });
         tx.send((tower_id, appointment.locator)).unwrap();
@@ -394,8 +391,8 @@ mod tests {
 
         let max_elapsed_time = MAX_ELAPSED_TIME + 1;
         let task = tokio::spawn(async move {
-            Retrier::new(wt_client_clone, max_elapsed_time, MAX_INTERVAL_TIME)
-                .manage_retry(rx)
+            RetryManager::new(wt_client_clone)
+                .manage_retry(MAX_ELAPSED_TIME, MAX_INTERVAL_TIME, rx)
                 .await
         });
         tx.send((tower_id, appointment.locator)).unwrap();
@@ -469,8 +466,8 @@ mod tests {
         // Start the task and send the tower to the channel for retry
         let wt_client_clone = wt_client.clone();
         let task = tokio::spawn(async move {
-            Retrier::new(wt_client_clone, MAX_ELAPSED_TIME, MAX_INTERVAL_TIME)
-                .manage_retry(rx)
+            RetryManager::new(wt_client_clone)
+                .manage_retry(MAX_ELAPSED_TIME, MAX_INTERVAL_TIME, rx)
                 .await
         });
         tx.send((tower_id, appointment.locator)).unwrap();
@@ -553,8 +550,8 @@ mod tests {
         // Start the task and send the tower to the channel for retry
         let wt_client_clone = wt_client.clone();
         let task = tokio::spawn(async move {
-            Retrier::new(wt_client_clone, MAX_ELAPSED_TIME, MAX_INTERVAL_TIME)
-                .manage_retry(rx)
+            RetryManager::new(wt_client_clone)
+                .manage_retry(MAX_ELAPSED_TIME, MAX_INTERVAL_TIME, rx)
                 .await
         });
         tx.send((tower_id, appointment.locator)).unwrap();
@@ -599,8 +596,8 @@ mod tests {
         // Start the task and send the tower to the channel for retry
         let wt_client_clone = wt_client.clone();
         let task = tokio::spawn(async move {
-            Retrier::new(wt_client_clone, MAX_ELAPSED_TIME, MAX_INTERVAL_TIME)
-                .manage_retry(rx)
+            RetryManager::new(wt_client_clone)
+                .manage_retry(MAX_ELAPSED_TIME, MAX_INTERVAL_TIME, rx)
                 .await
         });
 
@@ -654,9 +651,7 @@ mod tests {
         });
 
         // Since we are retrying manually, we need to add the data to pending appointments manually too
-        let retrier = Retrier::dummy(wt_client);
-        retrier.add_pending_appointment(tower_id, appointment.locator);
-
+        let retrier = Retrier::new(wt_client, appointment.locator);
         let r = retrier.retry_tower(tower_id).await;
         assert_eq!(r, Ok(()));
         api_mock.assert();
@@ -681,7 +676,7 @@ mod tests {
             .unwrap();
 
         // If there are no pending appointments the method will simply return
-        let r = Retrier::dummy(wt_client).retry_tower(tower_id).await;
+        let r = Retrier::empty(wt_client).retry_tower(tower_id).await;
         assert_eq!(
             r,
             Err(Error::permanent("Tower has no data pending for retry"))
@@ -729,9 +724,7 @@ mod tests {
         });
 
         // Since we are retrying manually, we need to add the data to pending appointments manually too
-        let retrier = Retrier::dummy(wt_client);
-        retrier.add_pending_appointment(tower_id, appointment.locator);
-
+        let retrier = Retrier::new(wt_client, appointment.locator);
         let r = retrier.retry_tower(tower_id).await;
         assert_eq!(r, Err(Error::permanent("Tower misbehaved")));
         api_mock.assert();
@@ -762,9 +755,7 @@ mod tests {
             .add_pending_appointment(tower_id, &appointment);
 
         // Since we are retrying manually, we need to add the data to pending appointments manually too
-        let retrier = Retrier::dummy(wt_client);
-        retrier.add_pending_appointment(tower_id, appointment.locator);
-
+        let retrier = Retrier::new(wt_client, appointment.locator);
         let r = retrier.retry_tower(tower_id).await;
 
         assert_eq!(r, Err(Error::transient("Tower cannot be reached")));
@@ -806,9 +797,7 @@ mod tests {
             .add_pending_appointment(tower_id, &appointment);
 
         // Since we are retrying manually, we need to add the data to pending appointments manually too
-        let retrier = Retrier::dummy(wt_client);
-        retrier.add_pending_appointment(tower_id, appointment.locator);
-
+        let retrier = Retrier::new(wt_client, appointment.locator);
         let r = retrier.retry_tower(tower_id).await;
 
         assert_eq!(r, Err(Error::permanent("Subscription error")));
@@ -851,9 +840,7 @@ mod tests {
             .add_pending_appointment(tower_id, &appointment);
 
         // Since we are retrying manually, we need to add the data to pending appointments manually too
-        let retrier = Retrier::dummy(wt_client.clone());
-        retrier.add_pending_appointment(tower_id, appointment.locator);
-
+        let retrier = Retrier::new(wt_client.clone(), appointment.locator);
         let r = retrier.retry_tower(tower_id).await;
 
         assert_eq!(r, Ok(()));
@@ -890,7 +877,7 @@ mod tests {
         wt_client.lock().unwrap().remove_tower(tower_id).unwrap();
 
         // If there are no pending appointments the method will simply return
-        let r = Retrier::dummy(wt_client).retry_tower(tower_id).await;
+        let r = Retrier::empty(wt_client).retry_tower(tower_id).await;
 
         assert_eq!(
             r,

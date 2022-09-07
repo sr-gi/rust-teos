@@ -22,7 +22,7 @@ use watchtower_plugin::net::http::{
     add_appointment, post_request, process_post_response, AddAppointmentError, ApiResponse,
     RequestError,
 };
-use watchtower_plugin::retrier::Retrier;
+use watchtower_plugin::retrier::RetryManager;
 use watchtower_plugin::wt_client::WTClient;
 use watchtower_plugin::TowerStatus;
 
@@ -612,8 +612,8 @@ async fn main() -> Result<(), Error> {
             60
         };
         tokio::spawn(async move {
-            Retrier::new(state_clone, max_elapsed_time, max_interval_time)
-                .manage_retry(rx)
+            RetryManager::new(state_clone)
+                .manage_retry(max_elapsed_time, max_interval_time, rx)
                 .await
         });
         plugin.join().await
