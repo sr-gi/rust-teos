@@ -94,7 +94,7 @@ impl RetryManager {
                             // Notice we'll end up here after a permanent error. That is, either after finishing the backoff strategy
                             // unsuccessfully or by manually raising such an error (like when facing a tower misbehavior)
                             if let Some(tower) = state.towers.get_mut(&tower_id) {
-                                if tower.status.is_unreachable() {
+                                if tower.status.is_temporary_unreachable() {
                                     log::warn!("Setting {} as unreachable", tower_id);
                                     state.set_tower_status(
                                         tower_id,
@@ -414,29 +414,25 @@ mod tests {
 
         // Wait for the elapsed time and check how the tower status changed
         tokio::time::sleep(Duration::from_secs(max_elapsed_time as u64 / 3)).await;
-        assert_eq!(
-            wt_client
-                .lock()
-                .unwrap()
-                .towers
-                .get(&tower_id)
-                .unwrap()
-                .status,
-            TowerStatus::TemporaryUnreachable
-        );
+        assert!(wt_client
+            .lock()
+            .unwrap()
+            .towers
+            .get(&tower_id)
+            .unwrap()
+            .status
+            .is_temporary_unreachable());
 
         // Wait until the task gives up and check again
         tokio::time::sleep(Duration::from_secs(max_elapsed_time as u64)).await;
-        assert_eq!(
-            wt_client
-                .lock()
-                .unwrap()
-                .towers
-                .get(&tower_id)
-                .unwrap()
-                .status,
-            TowerStatus::Unreachable
-        );
+        assert!(wt_client
+            .lock()
+            .unwrap()
+            .towers
+            .get(&tower_id)
+            .unwrap()
+            .status
+            .is_unreachable());
 
         task.abort();
     }

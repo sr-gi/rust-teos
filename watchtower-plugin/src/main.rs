@@ -318,9 +318,9 @@ async fn retry_tower(
     let tower_id = TowerId::try_from(v).map_err(|e| anyhow!(e))?;
     let state = plugin.state().lock().unwrap();
     if let Some(tower) = state.towers.get(&tower_id) {
-        if tower.status == TowerStatus::TemporaryUnreachable {
+        if tower.status.is_temporary_unreachable() {
             return Err(anyhow!("{} is already being retried", tower_id));
-        } else if tower.status != TowerStatus::Unreachable {
+        } else if !tower.status.is_unreachable() {
             return Err(anyhow!(
                 "Tower status must be unreachable to manually retry",
             ));
@@ -499,10 +499,13 @@ async fn on_commitment_revocation(
 
             let mut state = plugin.state().lock().unwrap();
             state.add_pending_appointment(tower_id, &appointment);
-            state
-                .unreachable_towers
-                .send((tower_id, appointment.locator))
-                .unwrap();
+
+            if status.is_temporary_unreachable() {
+                state
+                    .unreachable_towers
+                    .send((tower_id, appointment.locator))
+                    .unwrap();
+            }
         }
     }
 

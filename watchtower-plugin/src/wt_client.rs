@@ -59,7 +59,7 @@ impl WTClient {
 
         let towers = dbm.load_towers();
         for (tower_id, tower) in towers.iter() {
-            if tower.status.is_unreachable() {
+            if tower.status.is_temporary_unreachable() {
                 for locator in tower.pending_appointments.iter() {
                     unreachable_towers.send((*tower_id, *locator)).unwrap();
                 }
@@ -734,11 +734,11 @@ mod tests {
         // Check data in memory
         let tower_summary = wt_client.towers.get(&tower_id);
         assert!(tower_summary.is_some());
-        assert_eq!(tower_summary.unwrap().status, TowerStatus::Misbehaving);
+        assert!(tower_summary.unwrap().status.is_misbehaving());
 
         // Check data in DB
         let loaded_info = wt_client.load_tower_info(tower_id).unwrap();
-        assert_eq!(loaded_info.status, TowerStatus::Misbehaving);
+        assert!(loaded_info.status.is_misbehaving());
         assert_eq!(loaded_info.misbehaving_proof, Some(proof));
         assert!(loaded_info.appointments.contains_key(&appointment.locator));
     }
