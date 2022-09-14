@@ -67,12 +67,27 @@ impl RetryManager {
                     .await;
 
                     let mut state = wt_client.lock().unwrap();
-                    retriers.lock().unwrap().remove(&tower_id);
+                    let retrier = retriers.lock().unwrap().remove(&tower_id).unwrap();
 
                     match r {
                         Ok(_) => {
-                            log::info!("Retry strategy succeeded for {}", tower_id);
-                            state.set_tower_status(tower_id, crate::TowerStatus::Reachable);
+                            let pending_appointments = retrier.pending_appointments.lock().unwrap();
+                            if !pending_appointments.is_empty() {
+                                // If there are pending appointments by the time we remove the retrier we send them back through the channel
+                                // so they are not missed. Notice this is unlikely given the map is checked before exiting `retry_tower`, but it
+                                // can happen.
+                                log::info!(
+                                    "Some data was missed while retrying {}. Adding it back",
+                                    tower_id
+                                );
+                                for locator in retrier.pending_appointments.lock().unwrap().drain()
+                                {
+                                    state.unreachable_towers.send((tower_id, locator)).unwrap();
+                                }
+                            } else {
+                                log::info!("Retry strategy succeeded for {}", tower_id);
+                                state.set_tower_status(tower_id, crate::TowerStatus::Reachable);
+                            }
                         }
                         Err(e) => {
                             log::warn!("Retry strategy gave up for {}. {}", tower_id, e);
