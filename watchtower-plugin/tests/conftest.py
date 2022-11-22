@@ -58,7 +58,8 @@ class TeosCLI:
 
 class TeosD(TailableProc):
     def __init__(self, bitcoind_rpcport, directory="/tmp/watchtower-test"):
-        TailableProc.__init__(self, directory, verbose=True)
+        self.directory = directory
+        TailableProc.__init__(self, self.directory, verbose=True)
         self.teos_dir = os.path.join(directory, "teos")
         self.prefix = "teosd"
         self.cli = TeosCLI(directory)
@@ -80,12 +81,19 @@ class TeosD(TailableProc):
     def start(self, overwrite_key=False):
         if overwrite_key:
             self.cmd_line.append("--overwritekey")
-        TailableProc.start(self)
-        # FIXME: Temporarily removing this because I cannot figure out why some times the TailableProc cannot find the
-        # proper logline even if it is there. This normally happens after stopping and starting the TaibleProc, which
-        # made me think that re-initializing it may work (TailableProc.__init(...)) given that re-sets the logs and the
-        # offset, but this also fails some times. I don't think it is work wasting much more time here atm.
-        # self.wait_for_log("Tower ready", timeout=TIMEOUT)
+        if self.logsearch_start != 0:
+            TailableProc.__init__(self, self.directory, verbose=True)
+            self.prefix = "teosd"
+
+        try:
+            # FIXME: This is rather temporary but it makes not every subsequent test fail if `wait_for_logs` fails.
+            TailableProc.start(self)
+            if not self.is_in_log("Tower ready"):
+                self.wait_for_log("Tower ready", timeout=TIMEOUT)
+        except TimeoutError as e:
+            self.stop()
+            raise e
+
         logging.info("TeosD started")
 
     def stop(self):
