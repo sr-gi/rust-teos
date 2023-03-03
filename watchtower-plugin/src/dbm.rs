@@ -216,32 +216,40 @@ impl DBM {
         &self,
         tower_id: TowerId,
         user_id: UserId,
+        subscription_start: Option<u32>,
+        subscription_expiry: Option<u32>
     ) -> Result<RegistrationReceipt, Error> {
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT available_slots, subscription_start, subscription_expiry, signature
-                    FROM registration_receipts 
-                    WHERE tower_id = ?1 AND subscription_expiry = (SELECT MAX(subscription_expiry) 
-                        FROM registration_receipts 
-                        WHERE tower_id = ?1)",
-            )
-            .unwrap();
+        let mut query = "SELECT available_slots, subscription_start, subscription_expiry, signature FROM registration_receipts WHERE tower_id = ?1".to_string();
 
-        let receipt = stmt
-            .query_row([tower_id.to_vec()], |row| {
-                let slots: u32 = row.get(0).unwrap();
-                let start: u32 = row.get(1).unwrap();
-                let expiry: u32 = row.get(2).unwrap();
-                let signature: String = row.get(3).unwrap();
+    let mut params = vec![tower_id.to_vec()];
 
-                Ok(RegistrationReceipt::with_signature(
+    if let Some(start) = subscription_start {
+        query.push_str(" AND subscription_start >= ?2");
+        params.push(start.to_be_bytes().into());
+    }
+
+    if let Some(expiry) = subscription_expiry {
+        query.push_str(" AND subscription_expiry <= ?3");
+        params.push(expiry.to_be_bytes().into());
+    }
+
+    query.push_str(" ORDER BY subscription_expiry DESC LIMIT 1");
+
+    let mut stmt = self.connection.prepare(&query).unwrap();
+    let receipt = stmt
+        .query_row([tower_id.to_vec()], |row| {
+            let slots: u32 = row.get(0).unwrap();
+            let start: u32 = row.get(1).unwrap();
+            let expiry: u32 = row.get(2).unwrap();
+            let signature: String = row.get(3).unwrap();
+
+            Ok(RegistrationReceipt::with_signature(
                     user_id, slots, start, expiry, signature,
-                ))
-            })
-            .map_err(|_| Error::NotFound)?;
+                    ))
+        })
+    .map_err(|_| Error::NotFound)?;
 
-        Ok(receipt)
+    Ok(receipt)
     }
 
     /// Removes a tower record from the database.
@@ -259,13 +267,13 @@ impl DBM {
         let mut stmt = self
             .connection
             .prepare("SELECT tw.tower_id, tw.net_addr, tw.available_slots, rr.subscription_start, rr.subscription_expiry 
-                        FROM towers AS tw 
-                        JOIN registration_receipts AS rr 
-                        JOIN (SELECT tower_id, MAX(subscription_expiry) AS max_se 
-                            FROM registration_receipts 
-                            GROUP BY tower_id) AS max_rrs ON (tw.tower_id = rr.tower_id) 
-                        AND (rr.tower_id = max_rrs.tower_id) 
-                        AND (rr.subscription_expiry = max_rrs.max_se)")
+                     FROM towers AS tw 
+                     JOIN registration_receipts AS rr 
+                     JOIN (SELECT tower_id, MAX(subscription_expiry) AS max_se 
+                           FROM registration_receipts 
+                           GROUP BY tower_id) AS max_rrs ON (tw.tower_id = rr.tower_id) 
+                     AND (rr.tower_id = max_rrs.tower_id) 
+                     AND (rr.subscription_expiry = max_rrs.max_se)")
             .unwrap();
         let mut rows = stmt.query([]).unwrap();
 
@@ -284,7 +292,7 @@ impl DBM {
                 expiry,
                 self.load_appointment_locators(tower_id, AppointmentStatus::Pending),
                 self.load_appointment_locators(tower_id, AppointmentStatus::Invalid),
-            );
+                );
 
             if self.exists_misbehaving_proof(tower_id) {
                 tower.status = TowerStatus::Misbehaving;
@@ -308,23 +316,23 @@ impl DBM {
         locator: Locator,
         available_slots: u32,
         receipt: &AppointmentReceipt,
-    ) -> Result<(), SqliteError> {
+        ) -> Result<(), SqliteError> {
         let tx = self.get_mut_connection().transaction().unwrap();
         tx.execute(
             "INSERT INTO appointment_receipts (locator, tower_id, start_block, user_signature, tower_signature) 
-                VALUES (?1, ?2, ?3, ?4, ?5)",
+            VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                locator.to_vec(),
-                tower_id.to_vec(),
-                receipt.start_block(),
-                receipt.user_signature(),
-                receipt.signature()
+            locator.to_vec(),
+            tower_id.to_vec(),
+            receipt.start_block(),
+            receipt.user_signature(),
+            receipt.signature()
             ],
-        )?;
+            )?;
         tx.execute(
             "UPDATE towers SET available_slots=?1 WHERE tower_id=?2",
             params![available_slots, tower_id.to_vec()],
-        )?;
+            )?;
         tx.commit()
     }
 
@@ -333,7 +341,7 @@ impl DBM {
         &self,
         tower_id: TowerId,
         locator: Locator,
-    ) -> Result<AppointmentReceipt, Error> {
+        ) -> Result<AppointmentReceipt, Error> {
         let mut stmt = self
             .connection
             .prepare("SELECT start_block, user_signature, tower_signature FROM appointment_receipts WHERE tower_id = ?1 and locator = ?2")
@@ -345,10 +353,10 @@ impl DBM {
             let tower_sig = row.get::<_, String>(2).unwrap();
 
             Ok(AppointmentReceipt::with_signature(
-                user_sig,
-                start_block,
-                tower_sig,
-            ))
+                    user_sig,
+                    start_block,
+                    tower_sig,
+                    ))
         })
         .map_err(|_| Error::NotFound)
     }
@@ -383,7 +391,7 @@ impl DBM {
         &self,
         tower_id: TowerId,
         status: AppointmentStatus,
-    ) -> HashSet<Locator> {
+        ) -> HashSet<Locator> {
         let status = match status {
             AppointmentStatus::Accepted => "appointment_receipts",
             AppointmentStatus::Pending => "pending_appointments",
@@ -394,9 +402,9 @@ impl DBM {
         let mut stmt = self
             .connection
             .prepare(&format!(
-                "SELECT locator FROM {} WHERE tower_id = ?",
-                status
-            ))
+                    "SELECT locator FROM {} WHERE tower_id = ?",
+                    status
+                    ))
             .unwrap();
 
         let mut rows = stmt.query(params![tower_id.to_vec()]).unwrap();
@@ -431,15 +439,15 @@ impl DBM {
     fn store_appointment(
         tx: &rusqlite::Transaction,
         appointment: &Appointment,
-    ) -> Result<usize, SqliteError> {
+        ) -> Result<usize, SqliteError> {
         tx.execute(
             "INSERT INTO appointments (locator, encrypted_blob, to_self_delay) VALUES (?1, ?2, ?3)",
             params![
-                appointment.locator.to_vec(),
-                appointment.encrypted_blob,
-                appointment.to_self_delay
+            appointment.locator.to_vec(),
+            appointment.encrypted_blob,
+            appointment.to_self_delay
             ],
-        )
+            )
     }
 
     /// Stores a pending appointment into the database.
@@ -451,7 +459,7 @@ impl DBM {
         &mut self,
         tower_id: TowerId,
         appointment: &Appointment,
-    ) -> Result<(), SqliteError> {
+        ) -> Result<(), SqliteError> {
         let tx = self.get_mut_connection().transaction().unwrap();
 
         // If the appointment already exists (because it was added by another tower as either pending or invalid) we simply
@@ -460,7 +468,7 @@ impl DBM {
         tx.execute(
             "INSERT INTO pending_appointments (locator, tower_id) VALUES (?1, ?2)",
             params![appointment.locator.to_vec(), tower_id.to_vec(),],
-        )?;
+            )?;
 
         tx.commit()
     }
@@ -472,7 +480,7 @@ impl DBM {
         &mut self,
         tower_id: TowerId,
         locator: Locator,
-    ) -> Result<(), SqliteError> {
+        ) -> Result<(), SqliteError> {
         // We will delete data from pending_appointments or from appointments depending on whether the later has a single reference
         // to it or not. If that's the case, deleting the entry from appointments will trigger a cascade deletion of the entry in pending.
         // If there are other references, this will be deleted when removing the last one.
@@ -501,12 +509,12 @@ impl DBM {
             tx.execute(
                 "DELETE FROM appointments WHERE locator=?",
                 params![locator.to_vec()],
-            )?;
+                )?;
         } else {
             tx.execute(
                 "DELETE FROM pending_appointments WHERE locator=?1 AND tower_id=?2",
                 params![locator.to_vec(), tower_id.to_vec()],
-            )?;
+                )?;
         };
         tx.commit()
     }
@@ -520,7 +528,7 @@ impl DBM {
         &mut self,
         tower_id: TowerId,
         appointment: &Appointment,
-    ) -> Result<(), SqliteError> {
+        ) -> Result<(), SqliteError> {
         let tx = self.get_mut_connection().transaction().unwrap();
 
         // If the appointment already exists (because it was added by another tower as either pending or invalid) we simply
@@ -529,7 +537,7 @@ impl DBM {
         tx.execute(
             "INSERT INTO invalid_appointments (locator, tower_id) VALUES (?1, ?2)",
             params![appointment.locator.to_vec(), tower_id.to_vec(),],
-        )?;
+            )?;
 
         tx.commit()
     }
@@ -542,7 +550,7 @@ impl DBM {
         &self,
         tower_id: TowerId,
         status: AppointmentStatus,
-    ) -> Vec<Appointment> {
+        ) -> Vec<Appointment> {
         let table = match status {
             AppointmentStatus::Accepted => return Vec::new(),
             AppointmentStatus::Pending => "pending_appointments",
@@ -575,27 +583,27 @@ impl DBM {
         &mut self,
         tower_id: TowerId,
         proof: &MisbehaviorProof,
-    ) -> Result<(), SqliteError> {
+        ) -> Result<(), SqliteError> {
         let tx = self.get_mut_connection().transaction().unwrap();
         tx.execute(
             "INSERT INTO appointment_receipts (tower_id, locator, start_block, user_signature, tower_signature) 
-                VALUES (?1, ?2, ?3, ?4, ?5)",
+            VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                tower_id.to_vec(),
-                proof.locator.to_vec(),
-                proof.appointment_receipt.start_block(),
-                proof.appointment_receipt.user_signature(),
-                proof.appointment_receipt.signature()
+            tower_id.to_vec(),
+            proof.locator.to_vec(),
+            proof.appointment_receipt.start_block(),
+            proof.appointment_receipt.user_signature(),
+            proof.appointment_receipt.signature()
             ],
-        )?;
+            )?;
         tx.execute(
             "INSERT INTO misbehaving_proofs (tower_id, locator, recovered_id) VALUES (?1, ?2, ?3)",
             params![
-                tower_id.to_vec(),
-                proof.locator.to_vec(),
-                proof.recovered_id.to_vec()
+            tower_id.to_vec(),
+            proof.locator.to_vec(),
+            proof.recovered_id.to_vec()
             ],
-        )?;
+            )?;
 
         tx.commit()
     }
@@ -613,30 +621,30 @@ impl DBM {
                 let recovered_id = TowerId::from_slice(&row.get::<_, Vec<u8>>(1).unwrap()).unwrap();
                 Ok((locator, recovered_id))
             })
-            .map(|(locator, recovered_id)| {
-                let mut receipt_stmt = self
-                    .connection
-                    .prepare(
-                        "SELECT start_block, user_signature, tower_signature 
-                        FROM appointment_receipts 
-                        WHERE locator = ?1 AND tower_id = ?2",
+        .map(|(locator, recovered_id)| {
+            let mut receipt_stmt = self
+                .connection
+                .prepare(
+                    "SELECT start_block, user_signature, tower_signature 
+                    FROM appointment_receipts 
+                    WHERE locator = ?1 AND tower_id = ?2",
                     )
-                    .unwrap();
-                let receipt = receipt_stmt
-                    .query_row([locator.to_vec(), tower_id.to_vec()], |row| {
-                        let start_block = row.get::<_, u32>(0).unwrap();
-                        let user_signature = row.get::<_, String>(1).unwrap();
-                        let tower_signature = row.get::<_, String>(2).unwrap();
-                        Ok(AppointmentReceipt::with_signature(
+                .unwrap();
+            let receipt = receipt_stmt
+                .query_row([locator.to_vec(), tower_id.to_vec()], |row| {
+                    let start_block = row.get::<_, u32>(0).unwrap();
+                    let user_signature = row.get::<_, String>(1).unwrap();
+                    let tower_signature = row.get::<_, String>(2).unwrap();
+                    Ok(AppointmentReceipt::with_signature(
                             user_signature,
                             start_block,
                             tower_signature,
-                        ))
-                    })
-                    .unwrap();
-                MisbehaviorProof::new(locator, receipt, recovered_id)
-            })
-            .map_err(|_| Error::NotFound)
+                            ))
+                })
+            .unwrap();
+            MisbehaviorProof::new(locator, receipt, recovered_id)
+        })
+        .map_err(|_| Error::NotFound)
     }
 
     /// Checks whether a misbehaving proof exists for a given tower.
@@ -681,7 +689,7 @@ mod tests {
             &self,
             locator: Locator,
             tower_id: TowerId,
-        ) -> bool {
+            ) -> bool {
             let mut stmt = self
                 .connection
                 .prepare("SELECT * FROM appointment_receipts WHERE locator=?1 AND tower_id=?2 ")
@@ -715,7 +723,7 @@ mod tests {
             HashMap::new(),
             Vec::new(),
             Vec::new(),
-        );
+            );
 
         // Check the loaded data matches the in memory data
         dbm.store_tower_record(tower_id, net_addr, &receipt)
@@ -736,10 +744,10 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, receipt.user_id())
-                .unwrap(),
+            dbm.load_registration_receipt(tower_id, receipt.user_id(), None, None)
+            .unwrap(),
             receipt
-        );
+            );
 
         // Add another receipt for the same tower with a higher expiry and check this last one is loaded
         let middle_receipt = get_registration_receipt_from_previous(&receipt);
@@ -748,19 +756,19 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &latest_receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
-                .unwrap(),
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id(), None, None)
+            .unwrap(),
             latest_receipt
-        );
+            );
 
         // Add a final one with a lower expiry and check the last is still loaded
         dbm.store_tower_record(tower_id, net_addr, &middle_receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
-                .unwrap(),
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id(), None, None)
+            .unwrap(),
             latest_receipt
-        );
+            );
     }
 
     #[test]
@@ -776,17 +784,17 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, receipt.user_id())
-                .unwrap(),
+            dbm.load_registration_receipt(tower_id, receipt.user_id(), None, None)
+            .unwrap(),
             receipt
-        );
+            );
 
         // Store the same again, this should fail due to UNIQUE PK constrains.
         // Notice store_tower_record is guarded against this by WTClient::add_update_tower though.
         assert!(matches!(
-            dbm.store_tower_record(tower_id, net_addr, &receipt),
-            Err { .. }
-        ));
+                dbm.store_tower_record(tower_id, net_addr, &receipt),
+                Err { .. }
+                ));
     }
 
     #[test]
@@ -796,9 +804,9 @@ mod tests {
         // If the tower does not exists, `load_tower` will fail.
         let tower_id = get_random_user_id();
         assert!(matches!(
-            dbm.load_tower_record(tower_id),
-            Err(Error::NotFound)
-        ));
+                dbm.load_tower_record(tower_id),
+                Err(Error::NotFound)
+                ));
     }
 
     #[test]
@@ -828,8 +836,8 @@ mod tests {
                     receipt.available_slots(),
                     receipt.subscription_start(),
                     receipt.subscription_expiry(),
-                ),
-            );
+                    ),
+                    );
         }
 
         assert_eq!(dbm.load_towers(), towers);
@@ -860,9 +868,9 @@ mod tests {
         let dbm = DBM::in_memory().unwrap();
 
         assert!(matches!(
-            dbm.remove_tower_record(get_random_user_id()),
-            Err(Error::NotFound)
-        ));
+                dbm.remove_tower_record(get_random_user_id()),
+                Err(Error::NotFound)
+                ));
     }
 
     #[test]
@@ -879,7 +887,7 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
 
@@ -892,7 +900,7 @@ mod tests {
                 user_signature.to_owned(),
                 42,
                 "tower_signature".to_owned(),
-            );
+                );
 
             tower_summary.available_slots -= 1;
 
@@ -901,12 +909,12 @@ mod tests {
                 appointment.locator,
                 tower_summary.available_slots,
                 &appointment_receipt,
-            )
-            .unwrap();
+                )
+                .unwrap();
             receipts.insert(
                 appointment.locator,
                 appointment_receipt.signature().unwrap(),
-            );
+                );
         }
 
         assert_eq!(dbm.load_appointment_receipts(tower_id), receipts);
@@ -921,9 +929,9 @@ mod tests {
         // If there is no appointment receipt for the given (locator, tower_id) pair, Error::NotFound is returned
         // Try first with both being unknown
         assert!(matches!(
-            dbm.load_appointment_receipt(tower_id, appointment.locator),
-            Err(Error::NotFound)
-        ));
+                dbm.load_appointment_receipt(tower_id, appointment.locator),
+                Err(Error::NotFound)
+                ));
 
         // Add the tower but not the appointment and try again
         let net_addr = "talaia.watch";
@@ -932,9 +940,9 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            dbm.load_appointment_receipt(tower_id, appointment.locator),
-            Err(Error::NotFound)
-        ));
+                dbm.load_appointment_receipt(tower_id, appointment.locator),
+                Err(Error::NotFound)
+                ));
 
         // Add both
         let tower_summary = TowerSummary::new(
@@ -942,25 +950,25 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         let appointment_receipt = AppointmentReceipt::with_signature(
             "user_signature".to_owned(),
             42,
             "tower_signature".to_owned(),
-        );
+            );
         dbm.store_appointment_receipt(
             tower_id,
             appointment.locator,
             tower_summary.available_slots,
             &appointment_receipt,
-        )
-        .unwrap();
+            )
+            .unwrap();
 
         assert_eq!(
             dbm.load_appointment_receipt(tower_id, appointment.locator)
-                .unwrap(),
+            .unwrap(),
             appointment_receipt
-        );
+            );
     }
 
     #[test]
@@ -978,7 +986,7 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
 
@@ -993,7 +1001,7 @@ mod tests {
                 user_signature.to_owned(),
                 42,
                 "tower_signature".to_owned(),
-            );
+                );
             let pending_appointment = generate_random_appointment(None);
             let invalid_appointment = generate_random_appointment(None);
 
@@ -1002,8 +1010,8 @@ mod tests {
                 appointment.locator,
                 tower_summary.available_slots,
                 &appointment_receipt,
-            )
-            .unwrap();
+                )
+                .unwrap();
             dbm.store_pending_appointment(tower_id, &pending_appointment)
                 .unwrap();
             dbm.store_invalid_appointment(tower_id, &invalid_appointment)
@@ -1018,15 +1026,15 @@ mod tests {
         assert_eq!(
             dbm.load_appointment_locators(tower_id, AppointmentStatus::Accepted),
             receipts
-        );
+            );
         assert_eq!(
             dbm.load_appointment_locators(tower_id, AppointmentStatus::Pending),
             pending_appointments
-        );
+            );
         assert_eq!(
             dbm.load_appointment_locators(tower_id, AppointmentStatus::Invalid),
             invalid_appointments
-        );
+            );
     }
 
     #[test]
@@ -1065,8 +1073,8 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        )
-        .with_status(TowerStatus::TemporaryUnreachable);
+            )
+            .with_status(TowerStatus::TemporaryUnreachable);
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
 
@@ -1083,7 +1091,7 @@ mod tests {
             assert_eq!(
                 TowerSummary::from(dbm.load_tower_record(tower_id).unwrap()),
                 tower_summary
-            );
+                );
         }
     }
 
@@ -1113,8 +1121,8 @@ mod tests {
         // If this is called twice with for the same tower it will fail, since two identical references
         // can not exist. This is intended behavior and should not happen
         assert!(dbm
-            .store_pending_appointment(tower_id_2, &appointment)
-            .is_err());
+                .store_pending_appointment(tower_id_2, &appointment)
+                .is_err());
     }
 
     #[test]
@@ -1134,13 +1142,13 @@ mod tests {
         dbm.store_pending_appointment(tower_id, &appointment)
             .unwrap();
         assert!(dbm
-            .delete_pending_appointment(tower_id, appointment.locator)
-            .is_ok());
+                .delete_pending_appointment(tower_id, appointment.locator)
+                .is_ok());
 
         // The appointment should be completely gone
         assert!(!dbm
-            .load_appointment_locators(tower_id, AppointmentStatus::Pending)
-            .contains(&appointment.locator));
+                .load_appointment_locators(tower_id, AppointmentStatus::Pending)
+                .contains(&appointment.locator));
         assert!(!dbm.appointment_exists(appointment.locator));
 
         // Try again with more than one reference
@@ -1155,29 +1163,29 @@ mod tests {
             .unwrap();
         // Delete one
         assert!(dbm
-            .delete_pending_appointment(tower_id, appointment.locator)
-            .is_ok());
+                .delete_pending_appointment(tower_id, appointment.locator)
+                .is_ok());
         // Check
         assert!(!dbm
-            .load_appointment_locators(tower_id, AppointmentStatus::Pending)
-            .contains(&appointment.locator));
+                .load_appointment_locators(tower_id, AppointmentStatus::Pending)
+                .contains(&appointment.locator));
         assert!(dbm
-            .load_appointment_locators(another_tower_id, AppointmentStatus::Pending)
-            .contains(&appointment.locator));
+                .load_appointment_locators(another_tower_id, AppointmentStatus::Pending)
+                .contains(&appointment.locator));
         assert!(dbm.appointment_exists(appointment.locator));
 
         // Add an invalid reference and check again
         dbm.store_invalid_appointment(tower_id, &appointment)
             .unwrap();
         assert!(dbm
-            .delete_pending_appointment(another_tower_id, appointment.locator)
-            .is_ok());
+                .delete_pending_appointment(another_tower_id, appointment.locator)
+                .is_ok());
         assert!(!dbm
-            .load_appointment_locators(another_tower_id, AppointmentStatus::Pending)
-            .contains(&appointment.locator));
+                .load_appointment_locators(another_tower_id, AppointmentStatus::Pending)
+                .contains(&appointment.locator));
         assert!(dbm
-            .load_appointment_locators(tower_id, AppointmentStatus::Invalid)
-            .contains(&appointment.locator));
+                .load_appointment_locators(tower_id, AppointmentStatus::Invalid)
+                .contains(&appointment.locator));
         assert!(dbm.appointment_exists(appointment.locator));
     }
 
@@ -1195,7 +1203,7 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
 
@@ -1212,7 +1220,7 @@ mod tests {
             assert_eq!(
                 TowerSummary::from(dbm.load_tower_record(tower_id).unwrap()),
                 tower_summary
-            );
+                );
         }
     }
 
@@ -1240,8 +1248,8 @@ mod tests {
 
         // Two references from the same tower is not.
         assert!(dbm
-            .store_invalid_appointment(tower_id_2, &appointment)
-            .is_err());
+                .store_invalid_appointment(tower_id_2, &appointment)
+                .is_err());
     }
 
     #[test]
@@ -1258,13 +1266,13 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
             TowerSummary::from(dbm.load_tower_record(tower_id).unwrap()),
             tower_summary
-        );
+            );
 
         // Store a misbehaving proof and load it back
         let appointment = generate_random_appointment(None);
@@ -1272,13 +1280,13 @@ mod tests {
             "user_signature".to_owned(),
             42,
             "tower_signature".to_owned(),
-        );
+            );
 
         let proof = MisbehaviorProof::new(
             appointment.locator,
             appointment_receipt,
             get_random_user_id(),
-        );
+            );
 
         dbm.store_misbehaving_proof(tower_id, &proof).unwrap();
         assert_eq!(dbm.load_misbehaving_proof(tower_id).unwrap(), proof);
@@ -1288,9 +1296,9 @@ mod tests {
     fn test_store_load_non_existing_misbehaving_proof() {
         let dbm = DBM::in_memory().unwrap();
         assert!(matches!(
-            dbm.load_misbehaving_proof(get_random_user_id()),
-            Err(Error::NotFound)
-        ));
+                dbm.load_misbehaving_proof(get_random_user_id()),
+                Err(Error::NotFound)
+                ));
     }
 
     #[test]
@@ -1307,13 +1315,13 @@ mod tests {
             receipt.available_slots(),
             receipt.subscription_start(),
             receipt.subscription_expiry(),
-        );
+            );
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
             TowerSummary::from(dbm.load_tower_record(tower_id).unwrap()),
             tower_summary
-        );
+            );
 
         // // Store a misbehaving proof check
         let appointment = generate_random_appointment(None);
@@ -1321,13 +1329,13 @@ mod tests {
             "user_signature".to_owned(),
             42,
             "tower_signature".to_owned(),
-        );
+            );
 
         let proof = MisbehaviorProof::new(
             appointment.locator,
             appointment_receipt,
             get_random_user_id(),
-        );
+            );
 
         dbm.store_misbehaving_proof(tower_id, &proof).unwrap();
         assert!(dbm.exists_misbehaving_proof(tower_id));
