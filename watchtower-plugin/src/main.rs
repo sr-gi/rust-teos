@@ -137,15 +137,20 @@ async fn get_registration_receipt(
     plugin: Plugin<Arc<Mutex<WTClient>>>,
     v: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let tower_id = TowerId::try_from(v).map_err(|x| anyhow!(x))?;
+    let subscription_start = v["subscription_start"].as_u64().map(|v| v as u32);
+    let tower_id = TowerId::try_from(v.clone()).map_err(|x| anyhow!(x))?;
+    let subscription_expiry = v["subscription_expiry"].as_u64().map(|v| v as u32);
+
     let state = plugin.state().lock().unwrap();
 
-    let response = state.get_registration_receipt(tower_id).map_err(|_| {
-        anyhow!(
-            "Cannot find {} within the known towers. Have you registered?",
-            tower_id
-        )
-    })?;
+    let response = state
+        .get_registration_receipt(tower_id, subscription_start, subscription_expiry)
+        .map_err(|_| {
+            anyhow!(
+                "Cannot find {} within the known towers. Have you registered?",
+                tower_id
+            )
+        })?;
 
     Ok(json!(response))
 }
@@ -288,8 +293,8 @@ async fn get_tower_info(
     plugin: Plugin<Arc<Mutex<WTClient>>>,
     v: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let state = plugin.state().lock().unwrap();
     let tower_id = TowerId::try_from(v).map_err(|e| anyhow!(e))?;
+    let state = plugin.state().lock().unwrap();
     let tower_info = state.load_tower_info(tower_id).map_err(|_| {
         anyhow!(
             "Cannot find {} within the known towers. Have you registered?",
@@ -519,6 +524,16 @@ async fn main() -> Result<(), Error> {
     };
 
     let builder = Builder::new(stdin(), stdout())
+        .option(ConfigOption::new(
+            constants::SUBSCRIPTION_START,
+            Value::OptInteger,
+            constants::SUBSCRIPTION_START_DESC,
+        ))
+        .option(ConfigOption::new(
+            constants::SUBSCRIPTION_EXPIRY,
+            Value::OptInteger,
+            constants::SUBSCRIPTION_EXPIRY_DESC,
+        ))
         .option(ConfigOption::new(
             constants::WT_PORT,
             Value::Integer(constants::DEFAULT_WT_PORT),

@@ -3,6 +3,12 @@ pub const TOWERS_DATA_DIR: &str = "TOWERS_DATA_DIR";
 pub const DEFAULT_TOWERS_DATA_DIR: &str = ".watchtower";
 
 /// Collections of plugin option names, default values and descriptions
+pub const DEFAULT_SUBSCRIPTION_START: Option<i64> = None;
+pub const SUBSCRIPTION_START: &str = "subscription-start";
+pub const SUBSCRIPTION_START_DESC: &str = "subscription-start";
+pub const DEFAULT_SUBSCRIPTION_EXPIRY: Option<i64> = None;
+pub const SUBSCRIPTION_EXPIRY: &str = "subscription-expiry";
+pub const SUBSCRIPTION_EXPIRY_DESC: &str = "subscription-expiry";
 
 pub const WT_PORT: &str = "watchtower-port";
 pub const DEFAULT_WT_PORT: i64 = 9814;

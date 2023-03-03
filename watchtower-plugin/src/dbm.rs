@@ -216,18 +216,26 @@ impl DBM {
         &self,
         tower_id: TowerId,
         user_id: UserId,
+        subscription_start: Option<u32>,
+        subscription_expiry: Option<u32>,
     ) -> Result<RegistrationReceipt, Error> {
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT available_slots, subscription_start, subscription_expiry, signature
-                    FROM registration_receipts 
-                    WHERE tower_id = ?1 AND subscription_expiry = (SELECT MAX(subscription_expiry) 
-                        FROM registration_receipts 
-                        WHERE tower_id = ?1)",
-            )
-            .unwrap();
+        let mut query = "SELECT available_slots, subscription_start, subscription_expiry, signature FROM registration_receipts WHERE tower_id = ?1".to_string();
 
+        let mut params = vec![tower_id.to_vec()];
+
+        if let Some(start) = subscription_start {
+            query.push_str(" AND subscription_start >= ?2");
+            params.push(start.to_be_bytes().into());
+        }
+
+        if let Some(expiry) = subscription_expiry {
+            query.push_str(" AND subscription_expiry <= ?3");
+            params.push(expiry.to_be_bytes().into());
+        }
+
+        query.push_str(" ORDER BY subscription_expiry DESC LIMIT 1");
+
+        let mut stmt = self.connection.prepare(&query).unwrap();
         let receipt = stmt
             .query_row([tower_id.to_vec()], |row| {
                 let slots: u32 = row.get(0).unwrap();
@@ -259,13 +267,13 @@ impl DBM {
         let mut stmt = self
             .connection
             .prepare("SELECT tw.tower_id, tw.net_addr, tw.available_slots, rr.subscription_start, rr.subscription_expiry 
-                        FROM towers AS tw 
-                        JOIN registration_receipts AS rr 
-                        JOIN (SELECT tower_id, MAX(subscription_expiry) AS max_se 
-                            FROM registration_receipts 
-                            GROUP BY tower_id) AS max_rrs ON (tw.tower_id = rr.tower_id) 
-                        AND (rr.tower_id = max_rrs.tower_id) 
-                        AND (rr.subscription_expiry = max_rrs.max_se)")
+                     FROM towers AS tw 
+                     JOIN registration_receipts AS rr 
+                     JOIN (SELECT tower_id, MAX(subscription_expiry) AS max_se 
+                           FROM registration_receipts 
+                           GROUP BY tower_id) AS max_rrs ON (tw.tower_id = rr.tower_id) 
+                     AND (rr.tower_id = max_rrs.tower_id) 
+                     AND (rr.subscription_expiry = max_rrs.max_se)")
             .unwrap();
         let mut rows = stmt.query([]).unwrap();
 
@@ -312,15 +320,15 @@ impl DBM {
         let tx = self.get_mut_connection().transaction().unwrap();
         tx.execute(
             "INSERT INTO appointment_receipts (locator, tower_id, start_block, user_signature, tower_signature) 
-                VALUES (?1, ?2, ?3, ?4, ?5)",
+            VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                locator.to_vec(),
-                tower_id.to_vec(),
-                receipt.start_block(),
-                receipt.user_signature(),
-                receipt.signature()
+            locator.to_vec(),
+            tower_id.to_vec(),
+            receipt.start_block(),
+            receipt.user_signature(),
+            receipt.signature()
             ],
-        )?;
+            )?;
         tx.execute(
             "UPDATE towers SET available_slots=?1 WHERE tower_id=?2",
             params![available_slots, tower_id.to_vec()],
@@ -579,15 +587,15 @@ impl DBM {
         let tx = self.get_mut_connection().transaction().unwrap();
         tx.execute(
             "INSERT INTO appointment_receipts (tower_id, locator, start_block, user_signature, tower_signature) 
-                VALUES (?1, ?2, ?3, ?4, ?5)",
+            VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                tower_id.to_vec(),
-                proof.locator.to_vec(),
-                proof.appointment_receipt.start_block(),
-                proof.appointment_receipt.user_signature(),
-                proof.appointment_receipt.signature()
+            tower_id.to_vec(),
+            proof.locator.to_vec(),
+            proof.appointment_receipt.start_block(),
+            proof.appointment_receipt.user_signature(),
+            proof.appointment_receipt.signature()
             ],
-        )?;
+            )?;
         tx.execute(
             "INSERT INTO misbehaving_proofs (tower_id, locator, recovered_id) VALUES (?1, ?2, ?3)",
             params![
@@ -618,8 +626,8 @@ impl DBM {
                     .connection
                     .prepare(
                         "SELECT start_block, user_signature, tower_signature 
-                        FROM appointment_receipts 
-                        WHERE locator = ?1 AND tower_id = ?2",
+                    FROM appointment_receipts 
+                    WHERE locator = ?1 AND tower_id = ?2",
                     )
                     .unwrap();
                 let receipt = receipt_stmt
@@ -736,7 +744,7 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, receipt.user_id())
+            dbm.load_registration_receipt(tower_id, receipt.user_id(), None, None)
                 .unwrap(),
             receipt
         );
@@ -748,7 +756,7 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &latest_receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id(), None, None)
                 .unwrap(),
             latest_receipt
         );
@@ -757,7 +765,7 @@ mod tests {
         dbm.store_tower_record(tower_id, net_addr, &middle_receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, latest_receipt.user_id())
+            dbm.load_registration_receipt(tower_id, latest_receipt.user_id(), None, None)
                 .unwrap(),
             latest_receipt
         );
@@ -771,13 +779,20 @@ mod tests {
         let tower_id = get_random_user_id();
         let net_addr = "talaia.watch";
         let receipt = get_random_registration_receipt();
+        let subscription_start = None;
+        let subscription_expiry = None;
 
         // Store it once
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, receipt.user_id())
-                .unwrap(),
+            dbm.load_registration_receipt(
+                tower_id,
+                receipt.user_id(),
+                subscription_start,
+                subscription_expiry
+            )
+            .unwrap(),
             receipt
         );
 
