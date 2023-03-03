@@ -143,12 +143,14 @@ async fn get_registration_receipt(
 
     let state = plugin.state().lock().unwrap();
 
-    let response = state.get_registration_receipt(tower_id, subscription_start, subscription_expiry).map_err(|_| {
-        anyhow!(
-            "Cannot find {} within the known towers. Have you registered?",
-            tower_id
-        )
-    })?;
+    let response = state
+        .get_registration_receipt(tower_id, subscription_start, subscription_expiry)
+        .map_err(|_| {
+            anyhow!(
+                "Cannot find {} within the known towers. Have you registered?",
+                tower_id
+            )
+        })?;
 
     Ok(json!(response))
 }

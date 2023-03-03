@@ -187,9 +187,14 @@ impl WTClient {
         &self,
         tower_id: TowerId,
         subscription_start: Option<u32>,
-        subscription_expiry: Option<u32>
+        subscription_expiry: Option<u32>,
     ) -> Result<RegistrationReceipt, DBError> {
-        self.dbm.load_registration_receipt(tower_id, self.user_id, subscription_start, subscription_expiry)
+        self.dbm.load_registration_receipt(
+            tower_id,
+            self.user_id,
+            subscription_start,
+            subscription_expiry,
+        )
     }
 
     /// Loads a tower record from the database.
