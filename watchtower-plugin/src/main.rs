@@ -293,8 +293,8 @@ async fn get_tower_info(
     plugin: Plugin<Arc<Mutex<WTClient>>>,
     v: serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
-    let state = plugin.state().lock().unwrap();
     let tower_id = TowerId::try_from(v).map_err(|e| anyhow!(e))?;
+    let state = plugin.state().lock().unwrap();
     let tower_info = state.load_tower_info(tower_id).map_err(|_| {
         anyhow!(
             "Cannot find {} within the known towers. Have you registered?",
@@ -526,12 +526,12 @@ async fn main() -> Result<(), Error> {
     let builder = Builder::new(stdin(), stdout())
         .option(ConfigOption::new(
             constants::SUBSCRIPTION_START,
-            Value::Integer(constants::DEFAULT_SUBSCRIPTION_START.unwrap() as i64),
+            Value::OptInteger,
             constants::SUBSCRIPTION_START_DESC,
         ))
         .option(ConfigOption::new(
             constants::SUBSCRIPTION_EXPIRY,
-            Value::Integer(constants::DEFAULT_SUBSCRIPTION_EXPIRY.unwrap() as i64),
+            Value::OptInteger,
             constants::SUBSCRIPTION_EXPIRY_DESC,
         ))
         .option(ConfigOption::new(
