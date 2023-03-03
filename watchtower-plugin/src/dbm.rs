@@ -779,12 +779,14 @@ mod tests {
         let tower_id = get_random_user_id();
         let net_addr = "talaia.watch";
         let receipt = get_random_registration_receipt();
+        let subscription_start = None;
+        let subscription_expiry = None;
 
         // Store it once
         dbm.store_tower_record(tower_id, net_addr, &receipt)
             .unwrap();
         assert_eq!(
-            dbm.load_registration_receipt(tower_id, receipt.user_id(), None, None)
+            dbm.load_registration_receipt(tower_id, receipt.user_id(), subscription_start, subscription_expiry)
             .unwrap(),
             receipt
             );
