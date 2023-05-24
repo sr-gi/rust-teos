@@ -1,6 +1,8 @@
 //! Logic related to the tower configuration and command line parameter parsing.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::fmt;
+use std::ops::Deref;
 use std::path::PathBuf;
 use structopt::StructOpt;
 
@@ -29,11 +31,104 @@ pub fn from_file<T: Default + serde::de::DeserializeOwned>(path: &PathBuf) -> T 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+enum ParamSource {
+    ConfigFile,
+    CommandLine,
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigParam<T> {
+    inner: T,
+    source: ParamSource,
+    sensitive: bool,
+}
+
+impl<T> ConfigParam<T>
+where
+    T: DeserializeOwned,
+{
+    fn from_file(inner: T) -> Self {
+        Self {
+            inner,
+            source: ParamSource::ConfigFile,
+            sensitive: false,
+        }
+    }
+
+    fn from_cmd(inner: T) -> Self {
+        Self {
+            inner,
+            source: ParamSource::CommandLine,
+            sensitive: false,
+        }
+    }
+
+    fn from_default(inner: T) -> Self {
+        Self {
+            inner,
+            source: ParamSource::Default,
+            sensitive: false,
+        }
+    }
+
+    fn set_inner(&mut self, inner: T) {
+        self.inner = inner
+    }
+
+    fn is_default(&self) -> bool {
+        matches!(&self.source, ParamSource::Default)
+    }
+}
+
+impl<T> Deref for ConfigParam<T>
+where
+    T: DeserializeOwned,
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+// impl<T> Serialize for ConfigParam<T>
+// where
+//     T: DeserializeOwned,
+// {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         self.inner.serialize(serializer)
+//     }
+// }
+
+impl<'de, T> Deserialize<'de> for ConfigParam<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: DeserializeOwned,
+    {
+        Ok(ConfigParam::from_file(T::deserialize(deserializer)?))
+    }
+}
+
+impl<T> fmt::Display for ConfigParam<T>
+where
+    T: fmt::Display + DeserializeOwned + Serialize,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.inner)
+    }
+}
+
 /// Error raised if something is wrong with the configuration.
 #[derive(PartialEq, Eq, Debug)]
 pub struct ConfigError(String);
 
-impl std::fmt::Display for ConfigError {
+impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Configuration error: {}", self.0)
     }
@@ -122,89 +217,101 @@ pub struct Opt {
 /// - Defaults
 /// - Configuration file
 /// - Command line options
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(default)]
 pub struct Config {
     // API
-    pub api_bind: String,
-    pub api_port: u16,
+    pub api_bind: ConfigParam<String>,
+    pub api_port: ConfigParam<u16>,
 
     // RPC
-    pub rpc_bind: String,
-    pub rpc_port: u16,
+    pub rpc_bind: ConfigParam<String>,
+    pub rpc_port: ConfigParam<u16>,
 
     // Bitcoind
-    pub btc_network: String,
-    pub btc_rpc_user: String,
-    pub btc_rpc_password: String,
-    pub btc_rpc_connect: String,
-    pub btc_rpc_port: u16,
+    pub btc_network: ConfigParam<String>,
+    pub btc_rpc_user: ConfigParam<String>,
+    pub btc_rpc_password: ConfigParam<String>,
+    pub btc_rpc_connect: ConfigParam<String>,
+    pub btc_rpc_port: ConfigParam<u16>,
 
     // Flags
-    pub debug: bool,
-    pub deps_debug: bool,
-    pub overwrite_key: bool,
-    pub force_update: bool,
+    pub debug: ConfigParam<bool>,
+    pub deps_debug: ConfigParam<bool>,
+    pub overwrite_key: ConfigParam<bool>,
+    pub force_update: ConfigParam<bool>,
 
     // General
-    pub subscription_slots: u32,
-    pub subscription_duration: u32,
-    pub expiry_delta: u32,
-    pub min_to_self_delay: u16,
-    pub polling_delta: u16,
+    pub subscription_slots: ConfigParam<u32>,
+    pub subscription_duration: ConfigParam<u32>,
+    pub expiry_delta: ConfigParam<u32>,
+    pub min_to_self_delay: ConfigParam<u16>,
+    pub polling_delta: ConfigParam<u16>,
 
     // Internal API
-    pub internal_api_bind: String,
-    pub internal_api_port: u32,
+    pub internal_api_bind: ConfigParam<String>,
+    pub internal_api_port: ConfigParam<u32>,
 
     // Tor
-    pub tor_support: bool,
-    pub tor_control_port: u16,
-    pub onion_hidden_service_port: u16,
+    pub tor_support: ConfigParam<bool>,
+    pub tor_control_port: ConfigParam<u16>,
+    pub onion_hidden_service_port: ConfigParam<u16>,
 }
 
 impl Config {
     /// Patches the configuration options with the command line options.
     pub fn patch_with_options(&mut self, options: Opt) {
         if options.api_bind.is_some() {
-            self.api_bind = options.api_bind.unwrap();
+            self.api_bind = ConfigParam::from_cmd(options.api_bind.unwrap());
         }
         if options.api_port.is_some() {
-            self.api_port = options.api_port.unwrap();
+            self.api_port = ConfigParam::from_cmd(options.api_port.unwrap());
         }
         if options.rpc_bind.is_some() {
-            self.rpc_bind = options.rpc_bind.unwrap();
+            self.rpc_bind = ConfigParam::from_cmd(options.rpc_bind.unwrap());
         }
         if options.rpc_port.is_some() {
-            self.rpc_port = options.rpc_port.unwrap();
+            self.rpc_port = ConfigParam::from_cmd(options.rpc_port.unwrap());
         }
         if options.btc_network.is_some() {
-            self.btc_network = options.btc_network.unwrap();
+            self.btc_network = ConfigParam::from_cmd(options.btc_network.unwrap());
         }
         if options.btc_rpc_user.is_some() {
-            self.btc_rpc_user = options.btc_rpc_user.unwrap();
+            self.btc_rpc_user = ConfigParam::from_cmd(options.btc_rpc_user.unwrap());
         }
         if options.btc_rpc_password.is_some() {
-            self.btc_rpc_password = options.btc_rpc_password.unwrap();
+            self.btc_rpc_password = ConfigParam::from_cmd(options.btc_rpc_password.unwrap());
         }
         if options.btc_rpc_connect.is_some() {
-            self.btc_rpc_connect = options.btc_rpc_connect.unwrap();
+            self.btc_rpc_connect = ConfigParam::from_cmd(options.btc_rpc_connect.unwrap());
         }
         if options.btc_rpc_port.is_some() {
-            self.btc_rpc_port = options.btc_rpc_port.unwrap();
+            self.btc_rpc_port = ConfigParam::from_cmd(options.btc_rpc_port.unwrap());
         }
         if options.tor_control_port.is_some() {
-            self.tor_control_port = options.tor_control_port.unwrap();
+            self.tor_control_port = ConfigParam::from_cmd(options.tor_control_port.unwrap());
         }
         if options.onion_hidden_service_port.is_some() {
-            self.onion_hidden_service_port = options.onion_hidden_service_port.unwrap();
+            self.onion_hidden_service_port =
+                ConfigParam::from_cmd(options.onion_hidden_service_port.unwrap());
         }
-
-        self.tor_support |= options.tor_support;
-        self.debug |= options.debug;
-        self.deps_debug |= options.deps_debug;
-        self.overwrite_key = options.overwrite_key;
-        self.force_update = options.force_update;
+        // Bools
+        if options.tor_support {
+            self.tor_support = ConfigParam::from_cmd(options.tor_support);
+        }
+        if options.debug {
+            self.debug = ConfigParam::from_cmd(options.debug);
+        }
+        if options.deps_debug {
+            self.deps_debug = ConfigParam::from_cmd(options.deps_debug);
+        }
+        // FIXME:
+        if options.overwrite_key {
+            self.overwrite_key = ConfigParam::from_cmd(options.overwrite_key);
+        }
+        if options.force_update {
+            self.force_update = ConfigParam::from_cmd(options.force_update);
+        }
     }
 
     /// Verifies that [Config] is properly built.
@@ -216,19 +323,20 @@ impl Config {
     /// This will also assign the default `btc_rpc_port` depending on the network if it has not
     /// been overwritten at this point.
     pub fn verify(&mut self) -> Result<(), ConfigError> {
-        if self.btc_rpc_user == String::new() {
+        if self.btc_rpc_user.is_default() {
             return Err(ConfigError("btc_rpc_user must be set".to_owned()));
         }
-        if self.btc_rpc_password == String::new() {
+        if self.btc_rpc_password.is_default() {
             return Err(ConfigError("btc_rpc_password must be set".to_owned()));
         }
 
         // Normalize the network option to the ones used by bitcoind.
-        if ["mainnet", "testnet"].contains(&self.btc_network.as_str()) {
-            self.btc_network = self.btc_network.trim_end_matches("net").into();
+        if ["mainnet", "testnet"].contains(&self.btc_network.inner.as_str()) {
+            self.btc_network
+                .set_inner(self.btc_network.inner.trim_end_matches("net").into());
         }
 
-        let default_rpc_port = match self.btc_network.as_str() {
+        let default_rpc_port = match self.btc_network.inner.as_str() {
             "main" => 8332,
             "test" => 18332,
             "regtest" => 18443,
@@ -238,8 +346,8 @@ impl Config {
 
         // Set the port to it's default (depending on the network) if it has not been
         // overwritten at this point.
-        if self.btc_rpc_port == 0 {
-            self.btc_rpc_port = default_rpc_port;
+        if self.btc_rpc_port.is_default() {
+            self.btc_rpc_port.set_inner(default_rpc_port);
         }
 
         Ok(())
@@ -281,30 +389,30 @@ impl Default for Config {
     /// user does not use any values provided here).
     fn default() -> Self {
         Self {
-            api_bind: "127.0.0.1".into(),
-            api_port: 9814,
-            tor_support: false,
-            tor_control_port: 9051,
-            onion_hidden_service_port: 9814,
-            rpc_bind: "127.0.0.1".into(),
-            rpc_port: 8814,
-            btc_network: "mainnet".into(),
-            btc_rpc_user: String::new(),
-            btc_rpc_password: String::new(),
-            btc_rpc_connect: "localhost".into(),
-            btc_rpc_port: 0,
+            api_bind: ConfigParam::from_default("127.0.0.1".into()),
+            api_port: ConfigParam::from_default(9814),
+            tor_support: ConfigParam::from_default(false),
+            tor_control_port: ConfigParam::from_default(9051),
+            onion_hidden_service_port: ConfigParam::from_default(9814),
+            rpc_bind: ConfigParam::from_default("127.0.0.1".into()),
+            rpc_port: ConfigParam::from_default(8814),
+            btc_network: ConfigParam::from_default("mainnet".into()),
+            btc_rpc_user: ConfigParam::from_default(String::new()),
+            btc_rpc_password: ConfigParam::from_default(String::new()),
+            btc_rpc_connect: ConfigParam::from_default("localhost".into()),
+            btc_rpc_port: ConfigParam::from_default(0),
 
-            debug: false,
-            deps_debug: false,
-            overwrite_key: false,
-            force_update: false,
-            subscription_slots: 10000,
-            subscription_duration: 4320,
-            expiry_delta: 6,
-            min_to_self_delay: 20,
-            polling_delta: 60,
-            internal_api_bind: "127.0.0.1".into(),
-            internal_api_port: 50051,
+            debug: ConfigParam::from_default(false),
+            deps_debug: ConfigParam::from_default(false),
+            overwrite_key: ConfigParam::from_default(false),
+            force_update: ConfigParam::from_default(false),
+            subscription_slots: ConfigParam::from_default(10000),
+            subscription_duration: ConfigParam::from_default(4320),
+            expiry_delta: ConfigParam::from_default(6),
+            min_to_self_delay: ConfigParam::from_default(20),
+            polling_delta: ConfigParam::from_default(60),
+            internal_api_bind: ConfigParam::from_default("127.0.0.1".into()),
+            internal_api_port: ConfigParam::from_default(50051),
         }
     }
 }

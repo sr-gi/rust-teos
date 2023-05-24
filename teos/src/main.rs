@@ -84,14 +84,14 @@ async fn main() {
 
     // Set log level
     SimpleLogger::new()
-        .with_level(if conf.deps_debug {
+        .with_level(if *conf.deps_debug {
             LevelFilter::Debug
         } else {
             LevelFilter::Warn
         })
         .with_module_level(
             "teos",
-            if conf.debug {
+            if *conf.debug {
                 LevelFilter::Debug
             } else {
                 LevelFilter::Info
@@ -101,7 +101,7 @@ async fn main() {
         .unwrap();
 
     // Create network dir
-    let path_network = path.join(conf.btc_network.clone());
+    let path_network = path.join(&*conf.btc_network);
     fs::create_dir_all(&path_network).unwrap_or_else(|e| {
         eprintln!("Cannot create network dir: {e:?}");
         std::process::exit(1);
@@ -129,7 +129,7 @@ async fn main() {
     // key straightaway
     let (tower_sk, tower_pk) = {
         let locked_db = dbm.lock().unwrap();
-        if conf.overwrite_key {
+        if *conf.overwrite_key {
             log::info!("Overwriting tower keys");
             create_new_tower_keypair(&locked_db)
         } else if let Some(sk) = locked_db.load_tower_key() {
@@ -143,11 +143,11 @@ async fn main() {
 
     // Initialize our bitcoind client
     let (bitcoin_cli, bitcoind_reachable) = match BitcoindClient::new(
-        &conf.btc_rpc_connect,
-        conf.btc_rpc_port,
-        &conf.btc_rpc_user,
-        &conf.btc_rpc_password,
-        &conf.btc_network,
+        &*conf.btc_rpc_connect,
+        *conf.btc_rpc_port,
+        &*conf.btc_rpc_user,
+        &*conf.btc_rpc_password,
+        &*conf.btc_network,
     )
     .await
     {
@@ -175,7 +175,10 @@ async fn main() {
     let rpc = Arc::new(
         Client::new(
             &format!("{schema}{}:{}", conf.btc_rpc_connect, conf.btc_rpc_port),
-            Auth::UserPass(conf.btc_rpc_user.clone(), conf.btc_rpc_password.clone()),
+            Auth::UserPass(
+                (*conf.btc_rpc_user).clone(),
+                (*conf.btc_rpc_password).clone(),
+            ),
         )
         .unwrap(),
     );
@@ -204,7 +207,7 @@ async fn main() {
                     last_known_header.height - IRREVOCABLY_RESOLVED + 1,
                     last_known_header.height
                 );
-                if conf.force_update {
+                if *conf.force_update {
                     log::info!("Forcing a backend update");
                     // We want to grab the first IRREVOCABLY_RESOLVED we know about for the initial cache
                     // So we can perform transitions from there onwards.
@@ -270,9 +273,9 @@ async fn main() {
     // Build components
     let gatekeeper = Arc::new(Gatekeeper::new(
         tip.height,
-        conf.subscription_slots,
-        conf.subscription_duration,
-        conf.expiry_delta,
+        *conf.subscription_slots,
+        *conf.subscription_duration,
+        *conf.expiry_delta,
         dbm.clone(),
     ));
 
@@ -315,7 +318,7 @@ async fn main() {
         spv_client,
         tip,
         dbm,
-        conf.polling_delta,
+        *conf.polling_delta,
         shutdown_signal_cm,
         bitcoind_reachable.clone(),
     )
@@ -330,22 +333,22 @@ async fn main() {
         .parse()
         .unwrap();
     let mut addresses = vec![msgs::NetworkAddress::from_ipv4(
-        conf.api_bind.clone(),
-        conf.api_port,
+        (*conf.api_bind).clone(),
+        *conf.api_port,
     )];
 
     // Create Tor endpoint if required
-    let tor_api = if conf.tor_support {
+    let tor_api = if *conf.tor_support {
         let tor_api = TorAPI::new(
             http_api_addr,
-            conf.onion_hidden_service_port,
-            conf.tor_control_port,
+            *conf.onion_hidden_service_port,
+            *conf.tor_control_port,
             path_network,
         )
         .await;
         addresses.push(msgs::NetworkAddress::from_torv3(
             tor_api.get_onion_address(),
-            conf.onion_hidden_service_port,
+            *conf.onion_hidden_service_port,
         ));
 
         Some(tor_api)
