@@ -65,12 +65,21 @@ pub struct NetAddr {
     net_addr: String,
     #[serde(skip)]
     addr_type: AddressType,
+    #[serde(skip)]
+    localhost: bool,
 }
 
 impl NetAddr {
     pub fn new(net_addr: String) -> Self {
+        let addr = if net_addr.starts_with("http://") || net_addr.starts_with("https://") {
+            net_addr.split("://").collect::<Vec<&str>>()[1]
+        } else {
+            &net_addr
+        };
         NetAddr {
             addr_type: AddressType::get_type(&net_addr),
+            localhost: ["localhost", "127.0.0.1"]
+                .contains(&addr.split(':').collect::<Vec<&str>>()[0]),
             net_addr,
         }
     }
@@ -85,6 +94,10 @@ impl NetAddr {
 
     pub fn is_onion(&self) -> bool {
         self.addr_type().is_tor()
+    }
+
+    pub fn is_localhost(&self) -> bool {
+        self.localhost
     }
 }
 

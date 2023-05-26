@@ -163,7 +163,7 @@ async fn request<S: Serialize>(
     data: Option<S>,
 ) -> Result<Response, RequestError> {
     let client = if let Some(proxy) = proxy {
-        if proxy.always_use || tower_net_addr.is_onion() {
+        if (proxy.always_use && !tower_net_addr.is_localhost()) || tower_net_addr.is_onion() {
             reqwest::Client::builder()
                 .proxy(
                     reqwest::Proxy::http(proxy.get_socks_addr())
