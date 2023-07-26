@@ -47,3 +47,7 @@ jobs:
       - name: Run clippy
         run: |
           cargo clippy --all-features --all-targets --color always -- --deny warnings
+      - name: Install black
+        uses: psf/black@stable
+      - name: Check Python formatting
+        run: black . --check -l 120
