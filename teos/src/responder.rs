@@ -128,6 +128,18 @@ impl PenaltySummary {
     }
 }
 
+/// The outcome of rebroadcasting the stale penalties found in a given block.
+///
+/// Both sets are to be deleted from the tower, but they are kept apart given only the completed ones
+/// are entitled to a slot refund.
+#[derive(Debug, Default)]
+struct RebroadcastOutcome {
+    /// Trackers whose penalty was rejected by the backend on rebroadcast.
+    rejected: Vec<UUID>,
+    /// Trackers whose penalty turned out to be already irrevocably resolved.
+    completed: Vec<UUID>,
+}
+
 /// Component in charge of keeping track of triggered appointments.
 ///
 /// The [Responder] receives data from the [Watcher](crate::watcher::Watcher) in form of a [Breach].
@@ -268,8 +280,10 @@ impl Responder {
                 // Don't consider reorged trackers since they have wrong DB status.
                 continue;
             } else if let ConfirmationStatus::ConfirmedIn(h) = penalty_summary.status {
-                let confirmations = current_height - h;
-                if confirmations == constants::IRREVOCABLY_RESOLVED {
+                let confirmations = current_height.saturating_sub(h);
+                // Under normal operation mode, equality check should suffice. Be less strict in case we get here after
+                // a force update, which may skip block connections and make the confirmation count jump over the threshold.
+                if confirmations >= constants::IRREVOCABLY_RESOLVED {
                     // Tracker is deep enough in the chain, it can be deleted
                     completed_trackers.push(uuid);
                 } else {
@@ -280,7 +294,7 @@ impl Responder {
                 log::info!(
                     "Transaction missed a confirmation: {} (missed conf count: {})",
                     penalty_summary.penalty_txid,
-                    current_height - h
+                    current_height.saturating_sub(h)
                 );
             }
         }
@@ -361,11 +375,12 @@ impl Responder {
     /// This covers the case where a transaction is not getting confirmations (most likely due to low
     /// fess and needs to be bumped, but there is not much we can do until anchors).
     ///
-    /// Returns a vector of rejected trackers during rebroadcast if any were rejected, [None] otherwise.
-    fn rebroadcast_stale_txs(&self, height: u32) -> Option<Vec<UUID>> {
+    /// Returns the trackers that were rejected during rebroadcast, alongside those that turned out to be
+    /// already irrevocably resolved (see [RebroadcastOutcome]).
+    fn rebroadcast_stale_txs(&self, height: u32) -> RebroadcastOutcome {
         let dbm = self.dbm.lock().unwrap();
         let mut carrier = self.carrier.lock().unwrap();
-        let mut rejected = Vec::new();
+        let mut outcome = RebroadcastOutcome::default();
 
         // Retry sending trackers which have been in the mempool since more than `CONFIRMATIONS_BEFORE_RETRY` blocks.
         let stale_confirmation_status =
@@ -384,18 +399,28 @@ impl Responder {
             );
             // Rebroadcast the penalty transaction.
             let status = carrier.send_transaction(&tracker.penalty_tx);
-            if let ConfirmationStatus::Rejected(_) = status {
-                rejected.push(uuid);
-            } else {
-                // DISCUSS: What if the tower was down for some time and was later force updated while this penalty got on-chain?
-                // Sending it will yield `ConfirmationStatus::IrrevocablyResolved` which would panic here.
-                // We might want to replace `ConfirmationStatus::IrrevocablyResolved` variant with
-                // `ConfirmationStatus::ConfirmedIn(height - IRREVOCABLY_RESOLVED)
-                dbm.update_tracker_status(uuid, &status).unwrap();
+            match status {
+                ConfirmationStatus::Rejected(_) => outcome.rejected.push(uuid),
+                // The penalty is already in the chain, and deeper than IRREVOCABLY_RESOLVED (otherwise the
+                // `Carrier` would have found it in the `TxIndex`). This happens if the tower was down for a
+                // while and was later force updated while the penalty got confirmed. The job is done, so the
+                // tracker is completed and its user gets the slot back.
+                ConfirmationStatus::IrrevocablyResolved => {
+                    log::info!(
+                        "Penalty transaction is already in the chain, completing tracker (uuid={uuid})"
+                    );
+                    outcome.completed.push(uuid);
+                }
+                ConfirmationStatus::InMempoolSince(_) => {
+                    dbm.update_tracker_status(uuid, &status).unwrap();
+                }
+                _ => unreachable!(
+                    "`Carrier::send_transaction` shouldn't return this variant: {status:?}"
+                ),
             }
         }
 
-        (!rejected.is_empty()).then_some(rejected)
+        outcome
     }
 }
 
@@ -426,10 +451,10 @@ impl chain::Listen for Responder {
             .collect();
         self.tx_index.lock().unwrap().update(*header, &txs);
 
-        // Delete trackers completed at this height
-        if let Some(trackers) = self.check_confirmations(txs.keys().cloned().collect(), height) {
-            self.gatekeeper.delete_appointments(trackers, true);
-        }
+        // Collect the trackers completed at this height
+        let mut completed_trackers = self
+            .check_confirmations(txs.keys().cloned().collect(), height)
+            .unwrap_or_default();
 
         let mut trackers_to_delete = Vec::new();
         // We might be connecting a new block after a disconnection (reorg).
@@ -441,9 +466,16 @@ impl chain::Listen for Responder {
             }
         }
 
-        // Rebroadcast those transactions that need to
-        if let Some(trackers) = self.rebroadcast_stale_txs(height) {
-            trackers_to_delete.extend(trackers);
+        // Rebroadcast those transactions that need to. Some of them may turn out to be already resolved,
+        // in which case they are completed instead of deleted without a refund.
+        let rebroadcast = self.rebroadcast_stale_txs(height);
+        trackers_to_delete.extend(rebroadcast.rejected);
+        completed_trackers.extend(rebroadcast.completed);
+
+        // Delete the completed trackers, refunding the slots to their users
+        if !completed_trackers.is_empty() {
+            self.gatekeeper
+                .delete_appointments(completed_trackers, true);
         }
 
         if !trackers_to_delete.is_empty() {
@@ -928,11 +960,13 @@ mod tests {
                     txids.insert(breach.penalty_tx.compute_txid());
                 }
                 2 => {
+                    // NOTE: This needs to be less than IRREVOCABLY_RESOLVED confirmations deep, otherwise
+                    // the tracker would (rightfully) be completed.
                     responder.add_tracker(
                         uuid,
                         breach.clone(),
                         user_id,
-                        ConfirmationStatus::ConfirmedIn(42),
+                        ConfirmationStatus::ConfirmedIn(target_height - 42),
                     );
                     confirmed.insert(uuid);
                 }
@@ -994,9 +1028,46 @@ mod tests {
                     .load_tracker(uuid)
                     .unwrap()
                     .status,
-                ConfirmationStatus::ConfirmedIn(42)
+                ConfirmationStatus::ConfirmedIn(target_height - 42)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_check_confirmations_completed_after_skipped_blocks() {
+        // Trackers are completed once they reach IRREVOCABLY_RESOLVED confirmations. The tower may skip block
+        // connections (e.g. if it is force updated after running against a pruned node), making the confirmation
+        // count jump over that threshold. Those trackers must still be completed, otherwise both their data and
+        // their user's slots would be leaked.
+        let (responder, _s) = init_responder(MockedServerQuery::Regular).await;
+        let confirmation_height = 100;
+
+        let (user_id, uuid) = responder.store_dummy_appointment_to_db();
+        responder.add_tracker(
+            uuid,
+            get_random_breach(),
+            user_id,
+            ConfirmationStatus::ConfirmedIn(confirmation_height),
+        );
+
+        // One block short of the threshold nothing is completed.
+        assert!(responder
+            .check_confirmations(
+                HashSet::new(),
+                confirmation_height + constants::IRREVOCABLY_RESOLVED - 1
+            )
+            .is_none());
+
+        // Jumping over the threshold still completes the tracker.
+        assert_eq!(
+            responder
+                .check_confirmations(
+                    HashSet::new(),
+                    confirmation_height + constants::IRREVOCABLY_RESOLVED + 1
+                )
+                .unwrap(),
+            vec![uuid]
+        );
     }
 
     #[tokio::test]
@@ -1088,8 +1159,10 @@ mod tests {
             statues.insert(uuid, status);
         }
 
-        // There should be no rejected tx.
-        assert!(responder.rebroadcast_stale_txs(height).is_none());
+        // There should be no rejected nor completed tx.
+        let outcome = responder.rebroadcast_stale_txs(height);
+        assert!(outcome.rejected.is_empty());
+        assert!(outcome.completed.is_empty());
 
         for (uuid, former_status) in statues {
             let status = responder
@@ -1136,7 +1209,7 @@ mod tests {
 
         // `rebroadcast_stale_txs` will broadcast txs which has been in mempool since `CONFIRMATIONS_BEFORE_RETRY` or more
         // blocks. Since our backend rejects all the txs, all these broadcasted txs should be returned from this method (rejected).
-        let rejected = HashSet::from_iter(responder.rebroadcast_stale_txs(height).unwrap());
+        let rejected = HashSet::from_iter(responder.rebroadcast_stale_txs(height).rejected);
         let should_reject: HashSet<_> = statues
             .iter()
             .filter_map(|(&uuid, &status)| {
@@ -1160,6 +1233,43 @@ mod tests {
             // All tracker statues shouldn't change since the submitted ones were all rejected.
             assert_eq!(status, former_status);
         }
+    }
+
+    #[tokio::test]
+    async fn test_rebroadcast_stale_txs_already_in_chain() {
+        // If the tower skipped the block where a penalty got confirmed (e.g. due to a force update) the tracker
+        // is still flagged as in mempool, so it will be rebroadcast. The backend then replies telling us the
+        // transaction is already in the chain, meaning the job is done and the tracker can be completed.
+        let (responder, _s) = init_responder(MockedServerQuery::Error(
+            rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64,
+        ))
+        .await;
+        let height = 100;
+
+        let stale = responder
+            .add_random_tracker(ConfirmationStatus::InMempoolSince(
+                height - CONFIRMATIONS_BEFORE_RETRY as u32,
+            ))
+            .uuid();
+        // This one has not been in the mempool long enough, so it shouldn't be touched.
+        let fresh = responder
+            .add_random_tracker(ConfirmationStatus::InMempoolSince(height))
+            .uuid();
+
+        let outcome = responder.rebroadcast_stale_txs(height);
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(outcome.completed, vec![stale]);
+
+        assert_eq!(
+            responder
+                .dbm
+                .lock()
+                .unwrap()
+                .load_tracker(fresh)
+                .unwrap()
+                .status,
+            ConfirmationStatus::InMempoolSince(height)
+        );
     }
 
     #[tokio::test]
