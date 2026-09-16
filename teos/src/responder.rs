@@ -1,6 +1,6 @@
 //! Logic related to the Responder, the components in charge of making sure breaches get properly punished.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use bitcoin::hashes::Hash;
@@ -24,6 +24,9 @@ use crate::watcher::Breach;
 
 /// Number of missed confirmations to wait before rebroadcasting a transaction.
 const CONFIRMATIONS_BEFORE_RETRY: u8 = 6;
+
+/// Number of blocks a penalty that cannot be published is retried for before giving up on it (~1 week).
+const MAX_UNPUBLISHED_BLOCKS: u32 = 1008;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// The confirmation status of a given penalty transaction.
@@ -177,6 +180,10 @@ pub struct Responder {
     dbm: Arc<Mutex<DBM>>,
     /// A list of all the reorged trackers that might need to be republished after reorg resolution.
     reorged_trackers: Mutex<HashSet<UUID>>,
+    /// Heights at which penalties the backend keeps turning down were first found to be unpublishable.
+    ///
+    /// TODO(#240): Move to the tracker row, same as [Responder::reorged_trackers].
+    unpublished_since: Mutex<HashMap<UUID, u32>>,
 }
 
 impl Responder {
@@ -194,6 +201,7 @@ impl Responder {
             dbm,
             gatekeeper,
             reorged_trackers: Mutex::new(HashSet::new()),
+            unpublished_since: Mutex::new(HashMap::new()),
         }
     }
 
@@ -291,6 +299,17 @@ impl Responder {
                 "Failed to store tracker in database (uuid={uuid}). It might be already stored."
             );
         }
+    }
+
+    /// Whether a penalty has been impossible to publish for long enough to give up on it.
+    ///
+    /// The clock starts on the first rebroadcast that finds it still unpublishable, so it does not
+    /// survive a restart. Erring on the generous side there just means retrying for longer.
+    fn unpublishable_for_too_long(&self, uuid: UUID, height: u32) -> bool {
+        let mut unpublished_since = self.unpublished_since.lock().unwrap();
+        let since = *unpublished_since.entry(uuid).or_insert(height);
+
+        height.saturating_sub(since) >= MAX_UNPUBLISHED_BLOCKS
     }
 
     /// Checks whether a given tracker can be found in the [Responder].
@@ -441,12 +460,19 @@ impl Responder {
             if status.is_permanently_rejected() {
                 rejected.push(uuid);
             } else if status.is_transiently_rejected() {
-                // The penalty may still be accepted later on, so the tracker is kept. Re-stamping the
-                // height is what puts the next attempt `CONFIRMATIONS_BEFORE_RETRY` blocks away instead
-                // of on the very next one.
-                dbm.update_tracker_status(uuid, &ConfirmationStatus::InMempoolSince(height))
-                    .unwrap();
+                if self.unpublishable_for_too_long(uuid, height) {
+                    log::warn!("Giving up on a penalty we cannot publish (uuid={uuid})");
+                    rejected.push(uuid);
+                } else {
+                    // The penalty may still be accepted later on, so the tracker is kept. Re-stamping
+                    // the height is what puts the next attempt `CONFIRMATIONS_BEFORE_RETRY` blocks away
+                    // instead of on the very next one.
+                    dbm.update_tracker_status(uuid, &ConfirmationStatus::InMempoolSince(height))
+                        .unwrap();
+                }
             } else {
+                // It finally made it, so the clock stops
+                self.unpublished_since.lock().unwrap().remove(&uuid);
                 // DISCUSS: What if the tower was down for some time and was later force updated while this penalty got on-chain?
                 // Sending it will yield `ConfirmationStatus::IrrevocablyResolved` which would panic here.
                 // We might want to replace `ConfirmationStatus::IrrevocablyResolved` variant with
@@ -505,6 +531,12 @@ impl chain::Listen for Responder {
         if let Some(trackers) = self.rebroadcast_stale_txs(height) {
             trackers_to_delete.extend(trackers);
         }
+
+        // No entry outlives the horizon: either we just gave up on it, or its tracker is long gone
+        self.unpublished_since
+            .lock()
+            .unwrap()
+            .retain(|_, since| height.saturating_sub(*since) < MAX_UNPUBLISHED_BLOCKS);
 
         if !trackers_to_delete.is_empty() {
             self.gatekeeper
@@ -588,6 +620,11 @@ mod tests {
 
         pub(crate) fn get_carrier(&self) -> &Mutex<Carrier> {
             &self.carrier
+        }
+
+        /// Height at which a penalty was first found to be unpublishable, if the clock is running.
+        pub(crate) fn unpublished_since(&self, uuid: UUID) -> Option<u32> {
+            self.unpublished_since.lock().unwrap().get(&uuid).copied()
         }
 
         pub(crate) fn add_random_tracker(&self, status: ConfirmationStatus) -> TransactionTracker {
@@ -1318,6 +1355,42 @@ mod tests {
                 ConfirmationStatus::InMempoolSince(retried_at)
             );
         }
+
+        // We don't keep at it forever though: once a penalty has been impossible to publish for
+        // `MAX_UNPUBLISHED_BLOCKS`, it is handed back so the caller can wipe it.
+        let gave_up_at = retried_at + MAX_UNPUBLISHED_BLOCKS;
+        assert_eq!(
+            HashSet::<UUID>::from_iter(responder.rebroadcast_stale_txs(gave_up_at).unwrap()),
+            HashSet::from_iter(uuids)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unpublished_clock_stops_once_published() {
+        let (responder, _s) = init_responder(MockedServerQuery::Error(
+            rpc_errors::RPC_VERIFY_REJECTED as i64,
+        ))
+        .await;
+
+        let rejected_at = 100;
+        let uuid = responder
+            .add_random_tracker(ConfirmationStatus::InMempoolSince(
+                rejected_at - CONFIRMATIONS_BEFORE_RETRY as u32,
+            ))
+            .uuid();
+
+        // The clock starts the first time we find the penalty impossible to publish
+        assert!(responder.rebroadcast_stale_txs(rejected_at).is_none());
+        assert_eq!(responder.unpublished_since(uuid), Some(rejected_at));
+
+        // And stops once the backend finally takes it, so a penalty that comes and goes is not given up
+        // on based on how long ago it first failed
+        let (carrier, _as) = create_carrier(MockedServerQuery::Regular, rejected_at);
+        *responder.get_carrier().lock().unwrap() = carrier;
+
+        let published_at = rejected_at + CONFIRMATIONS_BEFORE_RETRY as u32;
+        assert!(responder.rebroadcast_stale_txs(published_at).is_none());
+        assert_eq!(responder.unpublished_since(uuid), None);
     }
 
     #[tokio::test]
