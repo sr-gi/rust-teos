@@ -18,6 +18,7 @@ use crate::carrier::Carrier;
 use crate::dbm::DBM;
 use crate::extended_appointment::UUID;
 use crate::gatekeeper::Gatekeeper;
+use crate::rpc_errors;
 use crate::tx_index::TxIndex;
 use crate::watcher::Breach;
 
@@ -62,6 +63,30 @@ impl ConfirmationStatus {
             self,
             ConfirmationStatus::ConfirmedIn(_) | &ConfirmationStatus::InMempoolSince(_)
         )
+    }
+
+    /// Whether the transaction was rejected for good, that is, it can never be accepted as-is.
+    ///
+    /// Rejections are assumed transient unless proven otherwise: dropping a penalty that may still make
+    /// it to the network means giving up on punishing a breach. `RPC_DESERIALIZATION_ERROR` is the only
+    /// one we can be sure about, reachable with a penalty rust-bitcoin deserializes but bitcoind won't,
+    /// such as a zero-input transaction. Everything else is retried.
+    ///
+    /// TODO(#35): Splitting the rest needs the reject reason, since `RPC_VERIFY_REJECTED` covers both
+    /// `mandatory-script-verify-flag-failed` and `mempool full`, and `RPC_VERIFY_ERROR` both
+    /// `bad-txns-inputs-missingorspent` and transient mempool errors. Notice that only sharpens the
+    /// classification: whoever crafts the penalty picks the reason, so it does not bound how long an
+    /// unpublishable one is kept around.
+    pub fn is_permanently_rejected(&self) -> bool {
+        matches!(
+            self,
+            ConfirmationStatus::Rejected(rpc_errors::RPC_DESERIALIZATION_ERROR)
+        )
+    }
+
+    /// Whether the transaction was rejected in a way that may be solved by retrying later on.
+    pub fn is_transiently_rejected(&self) -> bool {
+        matches!(self, ConfirmationStatus::Rejected(_)) && !self.is_permanently_rejected()
     }
 }
 
