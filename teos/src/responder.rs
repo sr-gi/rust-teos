@@ -18,7 +18,6 @@ use crate::carrier::Carrier;
 use crate::dbm::DBM;
 use crate::extended_appointment::UUID;
 use crate::gatekeeper::Gatekeeper;
-use crate::rpc_errors;
 use crate::tx_index::TxIndex;
 use crate::watcher::Breach;
 
@@ -41,7 +40,11 @@ pub enum ConfirmationStatus {
     /// unpublished, hence no giving up on it.
     InMempoolSince(u32),
     IrrevocablyResolved,
-    Rejected(i32),
+    // The penalty was rejected by the backend. The `permanent` field tells whether it can be retried or not.
+    Rejected {
+        code: i32,
+        permanent: bool,
+    },
 }
 
 impl ConfirmationStatus {
@@ -77,26 +80,31 @@ impl ConfirmationStatus {
 
     /// Whether the transaction was rejected for good, that is, it can never be accepted as-is.
     ///
-    /// Rejections are assumed transient unless proven otherwise: dropping a penalty that may still make
-    /// it to the network means giving up on punishing a breach. `RPC_DESERIALIZATION_ERROR` is the only
-    /// one we can be sure about, reachable with a penalty rust-bitcoin deserializes but bitcoind won't,
-    /// such as a zero-input transaction. Everything else is retried.
+    /// Told apart by the [Carrier](crate::carrier::Carrier) out of the rejection reason, defaulting to
+    /// retrying whenever the reason is not one we recognise: dropping a penalty that may still make it
+    /// to the network means giving up on punishing a breach.
     ///
-    /// TODO(#35): Splitting the rest needs the reject reason, since `RPC_VERIFY_REJECTED` covers both
-    /// `mandatory-script-verify-flag-failed` and `mempool full`, and `RPC_VERIFY_ERROR` both
-    /// `bad-txns-inputs-missingorspent` and transient mempool errors. Notice that only sharpens the
-    /// classification: whoever crafts the penalty picks the reason, so it does not bound how long an
-    /// unpublishable one is kept around.
+    /// Notice this only sharpens the classification. Whoever crafts the penalty also picks the reason
+    /// the backend reports, so it does not bound how long an unpublishable one is kept around.
     pub fn is_permanently_rejected(&self) -> bool {
         matches!(
             self,
-            ConfirmationStatus::Rejected(rpc_errors::RPC_DESERIALIZATION_ERROR)
+            ConfirmationStatus::Rejected {
+                permanent: true,
+                ..
+            }
         )
     }
 
     /// Whether the transaction was rejected in a way that may be solved by retrying later on.
     pub fn is_transiently_rejected(&self) -> bool {
-        matches!(self, ConfirmationStatus::Rejected(_)) && !self.is_permanently_rejected()
+        matches!(
+            self,
+            ConfirmationStatus::Rejected {
+                permanent: false,
+                ..
+            }
+        )
     }
 }
 
@@ -394,9 +402,9 @@ impl Responder {
                     );
                     true
                 }
-                ConfirmationStatus::Rejected(e) => {
+                ConfirmationStatus::Rejected { code, .. } => {
                     log::error!(
-                        "Reorged dispute tx (txid={}) rejected during rebroadcast (reason: {e:?})",
+                        "Reorged dispute tx (txid={}) rejected during rebroadcast (reason: {code:?})",
                         dispute_txid
                     );
                     false
@@ -409,7 +417,7 @@ impl Responder {
 
             if should_publish_penalty {
                 // Try to rebroadcast the penalty tx.
-                if let ConfirmationStatus::Rejected(_) =
+                if let ConfirmationStatus::Rejected { .. } =
                     carrier.send_transaction(&tracker.penalty_tx)
                 {
                     rejected.push(uuid)
@@ -729,7 +737,14 @@ mod tests {
             ConfirmationStatus::InMempoolSince(h).to_db_data(),
             Some((h, false))
         );
-        assert_eq!(ConfirmationStatus::Rejected(0).to_db_data(), None);
+        assert_eq!(
+            ConfirmationStatus::Rejected {
+                code: 0,
+                permanent: false
+            }
+            .to_db_data(),
+            None
+        );
         assert_eq!(ConfirmationStatus::IrrevocablyResolved.to_db_data(), None);
     }
 
@@ -864,7 +879,10 @@ mod tests {
         // A penalty rejected for good is not worth tracking, it can never be published
         assert_eq!(
             responder.handle_breach(uuid, breach, user_id),
-            ConfirmationStatus::Rejected(rpc_errors::RPC_DESERIALIZATION_ERROR)
+            ConfirmationStatus::Rejected {
+                code: rpc_errors::RPC_DESERIALIZATION_ERROR,
+                permanent: true,
+            }
         );
         assert!(!responder.has_tracker(uuid));
     }
@@ -881,7 +899,10 @@ mod tests {
 
         assert_eq!(
             responder.handle_breach(uuid, breach, user_id),
-            ConfirmationStatus::Rejected(rpc_errors::RPC_VERIFY_REJECTED)
+            ConfirmationStatus::Rejected {
+                code: rpc_errors::RPC_VERIFY_REJECTED,
+                permanent: false,
+            }
         );
 
         // The penalty may still make it to the network, so it is tracked as any other unconfirmed one.
