@@ -22,10 +22,10 @@ use crate::tx_index::TxIndex;
 use crate::watcher::Breach;
 
 /// Number of missed confirmations to wait before rebroadcasting a transaction.
-const CONFIRMATIONS_BEFORE_RETRY: u8 = 6;
+pub(crate) const CONFIRMATIONS_BEFORE_RETRY: u8 = 6;
 
 /// Number of blocks a penalty that cannot be published is retried for before giving up on it (~1 week).
-const MAX_UNPUBLISHED_BLOCKS: u32 = 1008;
+pub(crate) const MAX_UNPUBLISHED_BLOCKS: u32 = 1008;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// The confirmation status of a given penalty transaction.
@@ -1537,6 +1537,28 @@ mod tests {
             .rejected
             .is_empty());
         assert_eq!(responder.unpublished_since(uuid), None);
+    }
+
+    #[tokio::test]
+    async fn test_exploit_rebroadcast_of_an_already_confirmed_penalty() {
+        // The tower missed the block where the penalty confirmed (a force update), so the tracker is still
+        // flagged as unconfirmed and gets rebroadcast. The backend answers that it is already in the chain.
+        let (responder, _s) = init_responder(MockedServerQuery::Error(
+            rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64,
+        ))
+        .await;
+        let height = 100;
+
+        let uuid = responder
+            .add_random_tracker(ConfirmationStatus::InMempoolSince(
+                height - CONFIRMATIONS_BEFORE_RETRY as u32,
+            ))
+            .uuid();
+
+        // EXPLOIT CHECK: this must not bring the tower down, and the job is in fact done.
+        let outcome = responder.rebroadcast_stale_txs(height);
+        assert_eq!(outcome.completed, vec![uuid]);
+        assert!(outcome.rejected.is_empty());
     }
 
     #[tokio::test]

@@ -556,13 +556,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::dbm::DBM;
-    use crate::responder::ConfirmationStatus;
+    use crate::responder::{
+        ConfirmationStatus, CONFIRMATIONS_BEFORE_RETRY, MAX_UNPUBLISHED_BLOCKS,
+    };
     use crate::rpc_errors;
     use crate::test_utils::{
         create_carrier, create_responder, create_watcher, generate_dummy_appointment,
         generate_dummy_appointment_with_user, get_random_tx, BitcoindMock, BitcoindStopper,
         Blockchain, MockOptions, MockedServerQuery, DURATION, EXPIRY_DELTA, SLOTS, START_HEIGHT,
     };
+    use teos_common::constants::IRREVOCABLY_RESOLVED;
     use teos_common::cryptography::get_random_keypair;
 
     use bitcoin::secp256k1::{PublicKey, Secp256k1};
@@ -590,6 +593,190 @@ mod tests {
             self.responder
                 .add_random_tracker(ConfirmationStatus::ConfirmedIn(100))
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Exploit attempts against the reported findings. Both drive the tower the way a user would:
+    // add an appointment, then connect the blocks that make the tower act on it.
+    // ---------------------------------------------------------------------------------------------
+
+    /// Registers a user and leaves an appointment with the tower for a dispute that has not happened yet.
+    async fn park_an_appointment(
+        watcher: &Watcher,
+        dispute_tx: &Transaction,
+    ) -> (UserId, UUID, u32) {
+        let (user_sk, user_pk) = get_random_keypair();
+        let user_id = UserId(user_pk);
+        watcher.register(user_id).unwrap();
+
+        let (uuid, appointment) =
+            generate_dummy_appointment_with_user(user_id, Some(&dispute_tx.compute_txid()));
+        let signature = cryptography::sign(&appointment.inner.to_vec(), &user_sk);
+        let (_, slots, _) = watcher
+            .add_appointment(appointment.inner, signature)
+            .unwrap();
+
+        (user_id, uuid, slots)
+    }
+
+    /// Connects a block holding `txs` to the gatekeeper, the watcher and the responder, in that order,
+    /// which is how `main` chains the listeners.
+    fn connect_block(
+        watcher: &Watcher,
+        chain: &mut Blockchain,
+        txs: Option<Vec<Transaction>>,
+    ) -> u32 {
+        let block = chain.generate(txs);
+        let height = chain.get_block_count();
+        watcher.gatekeeper.block_connected(&block, height);
+        watcher.block_connected(&block, height);
+        watcher.responder.block_connected(&block, height);
+
+        height
+    }
+
+    #[tokio::test]
+    async fn test_exploit_transient_rejection_keeps_the_penalty() {
+        // The dispute confirms, the tower builds the justice transaction, and the backend turns it down for
+        // something that may well clear up later (a full mempool, a fee floor). Throwing the penalty away
+        // there is the reported funds loss: the tower is the user's only response to the breach, and the
+        // user is offline by assumption.
+        let mut chain = Blockchain::default().with_height(START_HEIGHT);
+        let (watcher, _s) = init_watcher(&mut chain).await;
+
+        let dispute_tx = get_random_tx();
+        let (_, uuid, _) = park_an_appointment(&watcher, &dispute_tx).await;
+
+        // A backend that turns every penalty down, without saying anything the tower recognises
+        let (carrier, _as) = create_carrier(
+            MockedServerQuery::Error(rpc_errors::RPC_VERIFY_REJECTED as i64),
+            chain.tip().deref().height,
+        );
+        *watcher.responder.get_carrier().lock().unwrap() = carrier;
+
+        let breach_height = connect_block(&watcher, &mut chain, Some(vec![dispute_tx]));
+
+        // EXPLOIT CHECK: the justice transaction is still the tower's problem.
+        assert!(
+            watcher.responder.has_tracker(uuid),
+            "penalty dropped on a rejection that can clear up: the breach goes unpunished for good"
+        );
+        assert!(watcher.dbm.lock().unwrap().appointment_exists(uuid));
+
+        let pending_since = |uuid| match watcher
+            .dbm
+            .lock()
+            .unwrap()
+            .load_tracker(uuid)
+            .unwrap()
+            .status
+        {
+            ConfirmationStatus::InMempoolSince(h) => h,
+            other => panic!("the penalty should still be pending, got {other:?}"),
+        };
+        let stamped_at = pending_since(uuid);
+
+        // And it is genuinely retried rather than merely stored: once the backend recovers, the penalty
+        // goes out on the next rebroadcast round.
+        let (carrier, _as2) = create_carrier(MockedServerQuery::Regular, breach_height);
+        *watcher.responder.get_carrier().lock().unwrap() = carrier;
+
+        for _ in 0..CONFIRMATIONS_BEFORE_RETRY {
+            connect_block(&watcher, &mut chain, None);
+        }
+
+        assert!(watcher.responder.has_tracker(uuid));
+        assert!(
+            pending_since(uuid) > stamped_at,
+            "the penalty was never rebroadcast after the backend recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exploit_transient_rejection_is_not_retried_forever() {
+        // The flip side of the above: a penalty that never becomes publishable must not be retried until the
+        // end of time, or a user can park unpublishable data in the tower and keep it working on it for free.
+        let mut chain = Blockchain::default().with_height(START_HEIGHT);
+        let (watcher, _s) = init_watcher(&mut chain).await;
+
+        let dispute_tx = get_random_tx();
+        let (_, uuid, _) = park_an_appointment(&watcher, &dispute_tx).await;
+
+        let (carrier, _as) = create_carrier(
+            MockedServerQuery::Error(rpc_errors::RPC_VERIFY_REJECTED as i64),
+            chain.tip().deref().height,
+        );
+        *watcher.responder.get_carrier().lock().unwrap() = carrier;
+
+        connect_block(&watcher, &mut chain, Some(vec![dispute_tx]));
+        assert!(watcher.responder.has_tracker(uuid));
+
+        // Keep the backend hostile for the whole horizon. Blocks are connected one by one so the retry
+        // schedule runs exactly as it would in production.
+        for _ in 0..MAX_UNPUBLISHED_BLOCKS + CONFIRMATIONS_BEFORE_RETRY as u32 {
+            connect_block(&watcher, &mut chain, None);
+            if !watcher.responder.has_tracker(uuid) {
+                break;
+            }
+        }
+
+        assert!(
+            !watcher.responder.has_tracker(uuid),
+            "a penalty that can never be published is retried forever"
+        );
+        assert!(!watcher.dbm.lock().unwrap().appointment_exists(uuid));
+    }
+
+    #[tokio::test]
+    async fn test_exploit_skipped_blocks_complete_the_tracker() {
+        // The penalty confirms, then the tower stops connecting blocks for a while (what a force update
+        // does) and comes back with the confirmation count already past the threshold. The tracker has to
+        // be completed all the same, otherwise it sits in the tower forever and the slot is never returned.
+        let mut chain = Blockchain::default().with_height(START_HEIGHT);
+        let (watcher, _s) = init_watcher(&mut chain).await;
+
+        let dispute_tx = get_random_tx();
+        let (user_id, uuid, slots_while_watching) =
+            park_an_appointment(&watcher, &dispute_tx).await;
+
+        // The dispute confirms, so the penalty goes out and a tracker is born
+        connect_block(&watcher, &mut chain, Some(vec![dispute_tx]));
+        assert!(watcher.responder.has_tracker(uuid));
+        let penalty_tx = watcher
+            .dbm
+            .lock()
+            .unwrap()
+            .load_tracker(uuid)
+            .unwrap()
+            .penalty_tx;
+
+        // And then confirms itself
+        connect_block(&watcher, &mut chain, Some(vec![penalty_tx]));
+
+        // Now the tower misses a long stretch of blocks and resumes well past the point where the penalty
+        // should have been called irrevocably resolved.
+        for _ in 0..IRREVOCABLY_RESOLVED + 58 {
+            chain.generate(None);
+        }
+        connect_block(&watcher, &mut chain, None);
+
+        // EXPLOIT CHECK: the tracker is finished with, and the user has their slot back.
+        assert!(
+            !watcher.responder.has_tracker(uuid),
+            "tracker never completed after a confirmation count jump: the slot is leaked"
+        );
+        assert_eq!(
+            watcher
+                .gatekeeper
+                .get_registered_users()
+                .lock()
+                .unwrap()
+                .get(&user_id)
+                .unwrap()
+                .available_slots,
+            slots_while_watching + 1,
+            "the slot was not refunded when the tracker completed"
+        );
     }
 
     async fn init_watcher(chain: &mut Blockchain) -> (Watcher, BitcoindStopper) {
