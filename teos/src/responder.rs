@@ -382,6 +382,7 @@ impl Responder {
         // `Responder` (see `handle_breach`). Taking them in any other order here would deadlock against
         // the API thread, which can call `handle_breach` while we are connecting a block.
         let mut carrier = self.carrier.lock().unwrap();
+        let tx_index = self.tx_index.lock().unwrap();
         let dbm = self.dbm.lock().unwrap();
         let mut outcome = RebroadcastOutcome::default();
 
@@ -396,18 +397,35 @@ impl Responder {
             .unwrap()
         {
             let tracker = dbm.load_tracker(uuid).unwrap();
-            log::warn!(
-                "Penalty transaction has missed many confirmations: {}",
-                tracker.penalty_tx.compute_txid()
-            );
+            let penalty_txid = tracker.penalty_tx.compute_txid();
+            log::warn!("Penalty transaction has missed many confirmations: {penalty_txid}");
+
+            // The penalty is still flagged as in mempool because `check_confirmations` never saw it
+            // confirm, i.e. its block was never connected. The index can still cover it though: it is
+            // seeded at startup with the last IRREVOCABLY_RESOLVED blocks pulled straight from the
+            // backend, which after a force update are the most recent blocks we skipped. Check it
+            // before bothering the backend, same guard as in `handle_breach`.
+            if let Some(block_hash) = tx_index.get(&penalty_txid) {
+                let confirmation_height = tx_index.get_height(block_hash).unwrap() as u32;
+                log::info!(
+                    "Penalty transaction was confirmed in a skipped block (uuid={uuid}, height={confirmation_height})"
+                );
+                dbm.update_tracker_status(
+                    uuid,
+                    &ConfirmationStatus::ConfirmedIn(confirmation_height),
+                )
+                .unwrap();
+                continue;
+            }
+
             // Rebroadcast the penalty transaction.
             let status = carrier.send_transaction(&tracker.penalty_tx);
             match status {
                 ConfirmationStatus::Rejected(_) => outcome.rejected.push(uuid),
-                // The penalty is already in the chain, and deeper than IRREVOCABLY_RESOLVED (otherwise the
-                // `Carrier` would have found it in the `TxIndex`). This happens if the tower was down for a
-                // while and was later force updated while the penalty got confirmed. The job is done, so the
-                // tracker is completed and its user gets the slot back.
+                // The penalty is in the chain but not in our `TxIndex`, which covers the last
+                // IRREVOCABLY_RESOLVED blocks, hence it is deep enough to be considered irrevocably resolved.
+                // This happens if the tower was down for a while and was later force updated while the penalty
+                // got confirmed. The job is done, so the tracker is completed and its user gets the slot back.
                 ConfirmationStatus::IrrevocablyResolved => {
                     log::info!(
                         "Penalty transaction is already in the chain, completing tracker (uuid={uuid})"
@@ -1242,7 +1260,8 @@ mod tests {
     async fn test_rebroadcast_stale_txs_already_in_chain() {
         // If the tower skipped the block where a penalty got confirmed (e.g. due to a force update) the tracker
         // is still flagged as in mempool, so it will be rebroadcast. The backend then replies telling us the
-        // transaction is already in the chain, meaning the job is done and the tracker can be completed.
+        // transaction is already in the chain. Given the penalty is not in our `TxIndex` (these are random txs),
+        // it is deeper than IRREVOCABLY_RESOLVED, so the job is done and the tracker can be completed.
         let (responder, _s) = init_responder(MockedServerQuery::Error(
             rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64,
         ))
@@ -1272,6 +1291,53 @@ mod tests {
                 .unwrap()
                 .status,
             ConfirmationStatus::InMempoolSince(height)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebroadcast_stale_txs_confirmed_in_skipped_block() {
+        // Same setup as the previous test, but this time the penalty confirmed recently enough for the block to
+        // still be covered by our `TxIndex`. The tracker is not deep enough to be completed, so it must simply be
+        // flagged as confirmed (and left for `check_confirmations` to complete later on), otherwise we would be
+        // refunding the slot and dropping the job while the penalty can still be reorged out.
+        let (responder, _s) = init_responder(MockedServerQuery::Error(
+            rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64,
+        ))
+        .await;
+
+        // The penalty confirmed in the tip of our index, and we are connecting the block right after it.
+        let (confirmation_block, confirmation_height) = {
+            let tx_index = responder.tx_index.lock().unwrap();
+            let block_hash = *tx_index.blocks().back().unwrap();
+            let height = tx_index.get_height(&block_hash).unwrap() as u32;
+            (block_hash, height)
+        };
+        let height = confirmation_height + 1;
+
+        let tracker = responder.add_random_tracker(ConfirmationStatus::InMempoolSince(
+            height - CONFIRMATIONS_BEFORE_RETRY as u32,
+        ));
+        responder
+            .tx_index
+            .lock()
+            .unwrap()
+            .index_mut()
+            .insert(tracker.penalty_tx.compute_txid(), confirmation_block);
+
+        // Nothing is rebroadcast nor completed, the tracker is just updated.
+        let outcome = responder.rebroadcast_stale_txs(height);
+        assert!(outcome.rejected.is_empty());
+        assert!(outcome.completed.is_empty());
+
+        assert_eq!(
+            responder
+                .dbm
+                .lock()
+                .unwrap()
+                .load_tracker(tracker.uuid())
+                .unwrap()
+                .status,
+            ConfirmationStatus::ConfirmedIn(confirmation_height)
         );
     }
 
