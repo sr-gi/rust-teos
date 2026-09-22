@@ -1282,6 +1282,17 @@ mod tests {
         assert!(outcome.rejected.is_empty());
         assert_eq!(outcome.completed, vec![stale]);
 
+        // Completed trackers are deleted by the caller, so their status must be left untouched here.
+        assert_eq!(
+            responder
+                .dbm
+                .lock()
+                .unwrap()
+                .load_tracker(stale)
+                .unwrap()
+                .status,
+            ConfirmationStatus::InMempoolSince(height - CONFIRMATIONS_BEFORE_RETRY as u32)
+        );
         assert_eq!(
             responder
                 .dbm
@@ -1611,6 +1622,73 @@ mod tests {
                 ConfirmationStatus::InMempoolSince(target_block_height),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_filtered_block_connected_refunds_completed_trackers() {
+        // Completing a tracker means the tower did its job, so the slot it was taking must go back to its user.
+        // Trackers can be completed either because they reached IRREVOCABLY_RESOLVED confirmations, or because
+        // the backend told us the penalty was already in the chain when rebroadcasting it.
+        let dbm = Arc::new(Mutex::new(DBM::in_memory().unwrap()));
+        let mut chain = Blockchain::default().with_height(START_HEIGHT * 2);
+        let (responder, _s) = init_responder_with_chain_and_dbm(
+            MockedServerQuery::Error(rpc_errors::RPC_VERIFY_ALREADY_IN_CHAIN as i64),
+            &mut chain,
+            dbm,
+        )
+        .await;
+        let target_block_height = chain.get_block_count() + 1;
+
+        let user_id = get_random_user_id();
+        responder.gatekeeper.add_update_user(user_id).unwrap();
+
+        // One tracker deep enough to be completed by `check_confirmations`, and one that has been in the mempool
+        // for long enough to be rebroadcast (and which the backend will report as already in the chain).
+        let statuses = [
+            ConfirmationStatus::ConfirmedIn(target_block_height - constants::IRREVOCABLY_RESOLVED),
+            ConfirmationStatus::InMempoolSince(
+                target_block_height - CONFIRMATIONS_BEFORE_RETRY as u32,
+            ),
+        ];
+        let mut uuids = Vec::new();
+        for status in statuses {
+            let dispute_tx = get_random_tx();
+            let (uuid, appointment) =
+                generate_dummy_appointment_with_user(user_id, Some(&dispute_tx.compute_txid()));
+            responder
+                .gatekeeper
+                .add_update_appointment(user_id, uuid, &appointment)
+                .unwrap();
+            responder
+                .dbm
+                .lock()
+                .unwrap()
+                .store_appointment(uuid, &appointment)
+                .unwrap();
+            responder.add_tracker(
+                uuid,
+                Breach::new(dispute_tx, get_random_tx()),
+                user_id,
+                status,
+            );
+            uuids.push(uuid);
+        }
+
+        // Both appointments are taking slots at this point.
+        let (user_info, locators) = responder.gatekeeper.get_user_info(user_id).unwrap();
+        assert!(user_info.available_slots < SLOTS);
+        assert_eq!(locators.len(), uuids.len());
+
+        let block = chain.generate(None);
+        responder.block_connected(&block, chain.get_block_count());
+
+        // Both trackers are gone and the user got all their slots back.
+        for uuid in uuids {
+            assert!(responder.dbm.lock().unwrap().load_tracker(uuid).is_none());
+        }
+        let (user_info, locators) = responder.gatekeeper.get_user_info(user_id).unwrap();
+        assert_eq!(user_info.available_slots, SLOTS);
+        assert!(locators.is_empty());
     }
 
     #[tokio::test]
