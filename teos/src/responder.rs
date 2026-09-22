@@ -378,8 +378,11 @@ impl Responder {
     /// Returns the trackers that were rejected during rebroadcast, alongside those that turned out to be
     /// already irrevocably resolved (see [RebroadcastOutcome]).
     fn rebroadcast_stale_txs(&self, height: u32) -> RebroadcastOutcome {
-        let dbm = self.dbm.lock().unwrap();
+        // WARNING(deadlock): Locks are taken in the `carrier` -> `tx_index` -> `dbm` order all over the
+        // `Responder` (see `handle_breach`). Taking them in any other order here would deadlock against
+        // the API thread, which can call `handle_breach` while we are connecting a block.
         let mut carrier = self.carrier.lock().unwrap();
+        let dbm = self.dbm.lock().unwrap();
         let mut outcome = RebroadcastOutcome::default();
 
         // Retry sending trackers which have been in the mempool since more than `CONFIRMATIONS_BEFORE_RETRY` blocks.
